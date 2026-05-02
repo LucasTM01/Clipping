@@ -2,36 +2,85 @@
 Configurações centrais do pipeline de clipping.
 """
 
-import os
 from pathlib import Path
-from dotenv import load_dotenv
+from pydantic import model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-load_dotenv()
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # API keys
+    openai_api_key: str = ""
+
+    # Analysis backend
+    analysis_backend: str = "ollama"   # "ollama" | "openai"
+    analysis_model: str = "qwen3.5:9b"
+
+    # Ollama
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "llama3.1:8b"
+
+    # OpenAI GPT
+    gpt_model: str = "gpt-4o"
+    gpt_max_tokens: int = 1524
+
+    # Parallelism
+    api_max_workers: int = 5
+    enrich_max_workers: int = 10
+
+    # Screener (legacy)
+    screener_confidence_threshold: float = 0.6
+    screener_snippet_length: int = 500
+    max_article_age_hours: int = 24
+
+    # Qdrant
+    qdrant_host: str = "localhost"
+    qdrant_port: int = 6333
+    qdrant_collection: str = "clipping_history"
+
+    # Embedding
+    embedding_model: str = "BAAI/bge-m3"
+    embedding_batch_size: int = 32
+    embedding_top_k: int = 5
+
+    # Document
+    document_title: str = "Briefing de Mercado — Equity Research"
+    document_subtitle: str = "Capital Goods & Industrials"
+
+    @model_validator(mode="after")
+    def _validate_openai(self) -> "Settings":
+        if self.analysis_backend == "openai" and not self.openai_api_key:
+            raise ValueError(
+                "ANALYSIS_BACKEND=openai requires OPENAI_API_KEY to be set in .env"
+            )
+        return self
+
+
+settings = Settings()
 
 # --- Diretórios ---
 BASE_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# --- API Keys ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")  # Coloque a chave no .env, não aqui!
-
-# --- Ollama ---
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-
-# --- Analysis backend ---
-# Set ANALYSIS_BACKEND=openai to use OpenAI GPT instead of local Ollama.
-ANALYSIS_BACKEND = os.getenv("ANALYSIS_BACKEND", "ollama")   # "ollama" | "openai"
-ANALYSIS_MODEL = os.getenv("ANALYSIS_MODEL", "qwen3.5:9b")   # Ollama model for analysis
-
-# --- OpenAI GPT (análise principal, usado quando ANALYSIS_BACKEND=openai) ---
-GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o")
-GPT_MAX_TOKENS = 1524
-
-# --- Paralelismo ---
-API_MAX_WORKERS = int(os.getenv("API_MAX_WORKERS", "5"))   # Chamadas GPT simultâneas
-ENRICH_MAX_WORKERS = int(os.getenv("ENRICH_MAX_WORKERS", "10"))  # Fetches HTTP simultâneos
+# --- Aliases de retrocompatibilidade ---
+# Permite que os módulos existentes continuem importando as constantes antigas
+# sem alteração enquanto não são migrados para `settings.*`.
+OPENAI_API_KEY = settings.openai_api_key
+OLLAMA_BASE_URL = settings.ollama_base_url
+OLLAMA_MODEL = settings.ollama_model
+ANALYSIS_BACKEND = settings.analysis_backend
+ANALYSIS_MODEL = settings.analysis_model
+GPT_MODEL = settings.gpt_model
+GPT_MAX_TOKENS = settings.gpt_max_tokens
+API_MAX_WORKERS = settings.api_max_workers
+ENRICH_MAX_WORKERS = settings.enrich_max_workers
+SCREENER_CONFIDENCE_THRESHOLD = settings.screener_confidence_threshold
+SCREENER_SNIPPET_LENGTH = settings.screener_snippet_length
+MAX_ARTICLE_AGE_HOURS = settings.max_article_age_hours
+DOCUMENT_TITLE = settings.document_title
+DOCUMENT_SUBTITLE = settings.document_subtitle
 
 # --- Feeds RSS ---
 RSS_FEEDS = [
@@ -143,6 +192,15 @@ COVERAGE_UNIVERSE = {
             "serviços", "outsourcing", "manutenção industrial",
         ],
     },
+    "INTB3": {
+        "company": "Intelbras",
+        "sector": "Industrials / Electronics & Security",
+        "keywords": [
+            "intelbras", "intb3", "segurança eletrônica", "câmeras de segurança",
+            "automação residencial", "redes", "energia solar", "alarmes",
+            "controle de acesso", "cftv", "smart home",
+        ],
+    },
 }
 
 # Setores relevantes para a seção macro/setorial
@@ -157,14 +215,3 @@ RELEVANT_SECTORS = [
     "bndes", "pac", "leilão", "concessão",
     "câmbio", "dólar", "selic", "juros", "inflação",
 ]
-
-# --- Filtro temporal (horas) ---
-MAX_ARTICLE_AGE_HOURS = 24
-
-# --- Screener ---
-SCREENER_SNIPPET_LENGTH = 500  # chars do texto para enviar ao LLM local
-SCREENER_CONFIDENCE_THRESHOLD = 0.6
-
-# --- Document ---
-DOCUMENT_TITLE = "Briefing de Mercado — Equity Research"
-DOCUMENT_SUBTITLE = "Capital Goods & Industrials"

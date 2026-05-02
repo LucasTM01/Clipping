@@ -2,11 +2,12 @@
 Ponto de entrada do pipeline de clipping para Equity Research.
 
 Uso:
-    python main.py                  # Execução padrão
-    python main.py --no-llm         # Sem Ollama (só keywords)
-    python main.py --no-enrich      # Sem extração de texto completo
-    python main.py --verbose        # Log detalhado
-    python main.py --schedule       # Roda em loop nos dias úteis
+    python main.py                       # Execução padrão (screener v2: BGE-M3 + Qdrant)
+    python main.py --legacy-screener     # Screener v1 (keyword + Ollama)
+    python main.py --no-llm              # Sem Ollama (só keywords, apenas com --legacy-screener)
+    python main.py --no-enrich           # Sem extração de texto completo
+    python main.py --verbose             # Log detalhado
+    python main.py --schedule            # Roda em loop nos dias úteis
 """
 
 import argparse
@@ -52,6 +53,11 @@ def main():
         default=7,
         help="Hora de execução no modo schedule (default: 7)",
     )
+    parser.add_argument(
+        "--legacy-screener",
+        action="store_true",
+        help="Usar screener v1 (keyword + Ollama) em vez do v2 (BGE-M3 + Qdrant)",
+    )
 
     args = parser.parse_args()
 
@@ -63,6 +69,7 @@ def main():
             use_llm_screener=not args.no_llm,
             enrich_text=not args.no_enrich,
             verbose=args.verbose,
+            use_legacy_screener=args.legacy_screener,
         )
         if output:
             print(f"\nBriefing gerado: {output}")
@@ -85,6 +92,7 @@ def _run_scheduled(args):
                     use_llm_screener=not args.no_llm,
                     enrich_text=not args.no_enrich,
                     verbose=args.verbose,
+                    use_legacy_screener=args.legacy_screener,
                 )
                 if output:
                     print(f"Briefing gerado: {output}")

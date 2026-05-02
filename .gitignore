@@ -1,0 +1,47 @@
+# Environment
+.env
+
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pipeline output
+output/
+
+# Qdrant storage
+.qdrant_storage/
+
+# Calibration (generated artifact, not source)
+config/calibration.json
+
+# Dataset backups
+*.jsonl.bak
+
+# Feedback loop (personal labels — not shared)
+feedback/labeled/
+feedback/candidates.jsonl
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code internal
+.claude/
+
+# Large / proprietary dataset files
+news_dataset/*.jsonl
+
+# Word input files
+data/*.docx
+
+# Stray pip artifact
+=1.9

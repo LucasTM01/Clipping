@@ -16,8 +16,11 @@ from pathlib import Path
 
 from fetcher.rss_fetcher import fetch_all_feeds, enrich_full_text
 from screener.local_llm import screen_articles
+from screener.screener_v2 import screen_articles_v2
 from analyzer.api_analyzer import analyze_batch
+from analyzer.tiered_dispatcher import dispatch_batch
 from generator.doc_generator import generate_briefing
+from data.export_feedback_candidates import export_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +58,7 @@ def run_pipeline(
     use_llm_screener: bool = True,
     enrich_text: bool = True,
     verbose: bool = False,
+    use_legacy_screener: bool = False,
 ) -> Path | None:
     """
     Executa o pipeline completo e retorna o path do documento gerado.
@@ -81,24 +85,43 @@ def run_pipeline(
         articles = enrich_full_text(articles)
 
     # --- Camada 2: Triagem ---
-    logger.info("--- CAMADA 2: Triagem de relevância ---")
-    screenings = screen_articles(articles, use_llm=use_llm_screener)
-
-    if not screenings:
-        logger.info("Nenhum artigo relevante identificado. Gerando documento vazio.")
-        output_path = generate_briefing([])
-        _log_summary(start_time, len(articles), 0, 0, output_path)
-        return output_path
-
-    # --- Camada 3: Análise ---
-    logger.info("--- CAMADA 3: Análise e sumarização ---")
-    analyses = analyze_batch(screenings)
+    if use_legacy_screener:
+        logger.info("--- CAMADA 2: Triagem de relevância (legacy: keyword + Ollama) ---")
+        screenings = screen_articles(articles, use_llm=use_llm_screener)
+        if not screenings:
+            logger.info("Nenhum artigo relevante identificado. Gerando documento vazio.")
+            output_path = generate_briefing([])
+            _log_summary(start_time, len(articles), 0, 0, output_path)
+            return output_path
+        logger.info("--- CAMADA 3: Análise e sumarização (legacy) ---")
+        analyses = analyze_batch(screenings)
+    else:
+        logger.info("--- CAMADA 2: Triagem de relevância (v2: BGE-M3 + Qdrant) ---")
+        scored = screen_articles_v2(articles)
+        if not scored:
+            logger.info("Nenhum artigo relevante identificado. Gerando documento vazio.")
+            output_path = generate_briefing([])
+            _log_summary(start_time, len(articles), 0, 0, output_path)
+            return output_path
+        logger.info("--- CAMADA 3: Análise e sumarização (tiered dispatcher) ---")
+        analyses = dispatch_batch(scored)
 
     # --- Camada 4: Documento ---
     logger.info("--- CAMADA 4: Geração do documento ---")
     output_path = generate_briefing(analyses)
 
-    _log_summary(start_time, len(articles), len(screenings), len(analyses), output_path)
+    n_relevant = len(scored) if not use_legacy_screener else len(screenings)
+    _log_summary(start_time, len(articles), n_relevant, len(analyses), output_path)
+
+    # Feedback loop: acumula near-miss candidates do audit log para revisão
+    if not use_legacy_screener:
+        try:
+            n_candidates = export_candidates()
+            if n_candidates:
+                logger.info(f"Feedback: {n_candidates} novos near-miss candidates -> feedback/candidates.jsonl")
+        except Exception as e:
+            logger.warning(f"Feedback export falhou (não crítico): {e}")
+
     return output_path
 
 

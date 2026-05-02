@@ -1,7 +1,7 @@
 """
 Camada 4 — Geração do documento de briefing em Word (.docx).
 
-Produz um documento estruturado por empresa com seção macro/setorial.
+Produz um documento estruturado por setor com subseções por empresa.
 """
 
 import logging
@@ -22,6 +22,21 @@ from config.settings import (
 from analyzer.api_analyzer import AnalysisResult
 
 logger = logging.getLogger(__name__)
+
+# Sector grouping — order defines document order
+SECTOR_GROUPS: list[tuple[str, list[str]]] = [
+    ("Aeroespacial", ["EMBR3"]),
+    ("Automotivo", ["POMO4", "RAPT4", "FRAS3", "MYPK3"]),
+    ("Energia e Tecnologia", ["WEGE3", "INTB3"]),
+    ("Outros", ["GGPS3", "ARML3", "MILS3"]),
+]
+
+# Reverse map: ticker -> sector name
+_TICKER_TO_SECTOR: dict[str, str] = {
+    ticker: sector
+    for sector, tickers in SECTOR_GROUPS
+    for ticker in tickers
+}
 
 
 def _add_header(doc: Document, date_str: str) -> None:
@@ -52,32 +67,31 @@ def _add_header(doc: Document, date_str: str) -> None:
     doc.add_paragraph("─" * 80)
 
 
-def _add_company_section(
+def _add_sector_section(
     doc: Document,
-    ticker: str,
+    sector_name: str,
+    tickers_in_sector: list[str],
     analyses: list[AnalysisResult],
 ) -> None:
-    """Adiciona seção de uma empresa ao documento."""
-    company_info = COVERAGE_UNIVERSE.get(ticker, {})
-    company_name = company_info.get("company", ticker)
-    sector = company_info.get("sector", "")
-
-    # Header da empresa
-    heading = doc.add_heading(level=2)
-    run = heading.add_run(f"{ticker} — {company_name}")
+    """Adds a sector section with all articles listed flat (no per-ticker subheadings)."""
+    heading = doc.add_heading(level=1)
+    run = heading.add_run(sector_name)
     run.font.color.rgb = RGBColor(0, 51, 102)
 
-    if sector:
-        sector_para = doc.add_paragraph()
-        run = sector_para.add_run(f"Setor: {sector}")
-        run.italic = True
-        run.font.size = Pt(9)
-        run.font.color.rgb = RGBColor(128, 128, 128)
+    tickers_label = "  |  ".join(
+        f"{t} — {COVERAGE_UNIVERSE.get(t, {}).get('company', t)}"
+        for t in tickers_in_sector
+    )
+    label_para = doc.add_paragraph()
+    run = label_para.add_run(tickers_label)
+    run.italic = True
+    run.font.size = Pt(9)
+    run.font.color.rgb = RGBColor(128, 128, 128)
 
     for analysis in analyses:
         _add_news_item(doc, analysis)
 
-    doc.add_paragraph()  # espaço entre seções
+    doc.add_paragraph()
 
 
 def _sentiment_indicator(sentiment: str) -> str:
@@ -204,36 +218,39 @@ def generate_briefing(analyses: list[AnalysisResult]) -> Path:
     # Tabela resumo
     _add_summary_table(doc, analyses)
 
-    # Separa por empresa e macro
-    company_analyses: dict[str, list[AnalysisResult]] = {}
+    # Group by sector — each article goes to exactly one sector (first ticker match wins)
+    by_sector: dict[str, list[AnalysisResult]] = {}
     macro_analyses: list[AnalysisResult] = []
 
     for analysis in analyses:
-        if analysis.category == "company" and analysis.tickers:
+        sector = None
+        if analysis.tickers:
             for ticker in analysis.tickers:
-                if ticker not in company_analyses:
-                    company_analyses[ticker] = []
-                company_analyses[ticker].append(analysis)
+                if ticker in _TICKER_TO_SECTOR:
+                    sector = _TICKER_TO_SECTOR[ticker]
+                    break
+        if sector:
+            by_sector.setdefault(sector, []).append(analysis)
         else:
             macro_analyses.append(analysis)
 
-    # Seções por empresa (ordenadas por ticker)
-    if company_analyses:
-        doc.add_heading("Notícias por Empresa", level=1)
-        for ticker in sorted(company_analyses.keys()):
-            _add_company_section(doc, ticker, company_analyses[ticker])
+    # Sector sections
+    for sector_name, tickers_in_sector in SECTOR_GROUPS:
+        if sector_name in by_sector:
+            _add_sector_section(doc, sector_name, tickers_in_sector, by_sector[sector_name])
 
-    # Seção macro/setorial
+    # Macro / sectoral
     if macro_analyses:
-        doc.add_heading("Macro / Setorial", level=1)
-        sector_para = doc.add_paragraph()
-        run = sector_para.add_run(
+        heading = doc.add_heading(level=1)
+        run = heading.add_run("Macro / Setorial")
+        run.font.color.rgb = RGBColor(0, 51, 102)
+        desc = doc.add_paragraph()
+        run = desc.add_run(
             "Notícias relevantes para os setores de cobertura sem ticker específico."
         )
         run.italic = True
         run.font.size = Pt(9)
         run.font.color.rgb = RGBColor(128, 128, 128)
-
         for analysis in macro_analyses:
             _add_news_item(doc, analysis)
 

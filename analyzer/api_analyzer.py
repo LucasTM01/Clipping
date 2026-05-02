@@ -44,6 +44,8 @@ class AnalysisResult:
     action_detail: str | None
     category: str  # "company" ou "macro_sectoral"
     sector_tags: list[str]
+    relevance_score: float | None = None   # preenchido pelo screener v2
+    tier: str | None = None                # "high" | "medium" | "low_review" | None
 
 
 def _build_analysis_prompt(screening: ScreeningResult) -> str:
@@ -67,6 +69,7 @@ def _analyze_one_ollama(screening: ScreeningResult) -> AnalysisResult:
     url = f"{OLLAMA_BASE_URL}/api/chat"
     payload = {
         "model": ANALYSIS_MODEL,
+        "think": False,
         "messages": [
             {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -75,7 +78,7 @@ def _analyze_one_ollama(screening: ScreeningResult) -> AnalysisResult:
         "format": "json",
         "options": {
             "temperature": 0.1,
-            "num_predict": 512,
+            "num_predict": 800,
         },
     }
 

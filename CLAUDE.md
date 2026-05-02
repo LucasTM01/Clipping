@@ -1,10 +1,16 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
 
 ## Project Purpose
 
-Automated daily briefing pipeline for Brazilian equity research covering Capital Goods & Industrials. Runs every business day, collects news from RSS feeds, filters for relevance to a 9-ticker coverage universe, generates GPT-based analysis, and outputs a formatted Word document.
+Automated daily briefing pipeline for Brazilian equity research — Capital Goods & Industrials.
+Collects RSS news, filters by relevance via embedding-based screener (BGE-M3 + Qdrant),
+analyzes with a local LLM (Qwen3.5:9b via Ollama), and outputs a sector-grouped Word document.
+
+Coverage: EMBR3, POMO4, RAPT4, FRAS3, MYPK3, WEGE3, INTB3, GGPS3, ARML3, MILS3.
+
+---
 
 ## Running the Pipeline
 
@@ -12,79 +18,153 @@ Automated daily briefing pipeline for Brazilian equity research covering Capital
 # Activate venv first
 .venv\Scripts\activate
 
-# Standard run (requires OPENAI_API_KEY in .env)
+# Standard run
 python main.py
 
-# Fast smoke test — no API calls, no HTTP enrichment
-python main.py --no-llm --no-enrich
+# No HTTP enrichment (faster, uses only headlines for embeddings)
+python main.py --no-enrich
 
-# Full debug output
-python main.py --no-llm --no-enrich --verbose
+# Smoke test — no enrichment, no API cost
+python main.py --no-enrich --verbose
 
-# Scheduled mode — runs at 07:00 on business days, polling every 60s
+# Scheduled mode — runs at 07:00 on business days
 python main.py --schedule
 python main.py --schedule --schedule-hour 6
+
+# Legacy screener v1 (keyword + Ollama) — kept for regression comparison
+python main.py --legacy-screener
 ```
 
-## Environment Setup
+## Tests
 
-Create `.env` in the project root (see `.env.example`):
-
-```
-OPENAI_API_KEY=sk-proj-...
-GPT_MODEL=gpt-4o           # or gpt-4o-mini for lower cost
-API_MAX_WORKERS=5          # parallel GPT calls
-ENRICH_MAX_WORKERS=10      # parallel HTTP fetches
-OLLAMA_BASE_URL=http://localhost:11434   # only needed if not using --no-llm
-OLLAMA_MODEL=llama3.1:8b
+```powershell
+python -m pytest tests/ -v   # 56 tests, no external deps (Qdrant mocked)
 ```
 
-## Architecture: 5-Layer Pipeline
+## Dataset & Calibration (run when adding new data)
 
-Data flows strictly top-to-bottom through `pipeline.py → run_pipeline()`. No layer reaches back into a previous one.
+```powershell
+# 1. Ingest dataset + feedback/labeled/ into Qdrant (requires GPU/CUDA)
+python -m data.ingest_history
+
+# 2. Recalibrate discard threshold via LOO-CV
+python -m data.calibrate_threshold
+
+# 3. Export near-miss candidates from audit logs for manual review
+python -m data.export_feedback_candidates
+
+# 4. Review candidates in browser UI
+streamlit run review_feedback.py
+```
+
+---
+
+## Environment (.env)
 
 ```
-Layer 1   fetcher/rss_fetcher.py    feedparser → list[Article]
-Layer 1b  fetcher/rss_fetcher.py    trafilatura full-text fetch (parallelized, 10 workers)
-Layer 2   screener/local_llm.py     keyword prefilter → Ollama LLM → list[ScreeningResult]
-Layer 3   analyzer/api_analyzer.py  OpenAI GPT → list[AnalysisResult]  (parallelized, 5 workers)
-Layer 4   generator/doc_generator.py  python-docx → output/briefing_YYYYMMDD_HHMM.docx
+ANALYSIS_BACKEND=ollama          # "ollama" | "openai"
+ANALYSIS_MODEL=qwen3.5:9b
+OLLAMA_BASE_URL=http://localhost:11434
+OPENAI_API_KEY=sk-proj-...       # only needed if ANALYSIS_BACKEND=openai
+GPT_MODEL=gpt-4o
+API_MAX_WORKERS=5
+ENRICH_MAX_WORKERS=10
+EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_TOP_K=5
+QDRANT_HOST=localhost
+QDRANT_PORT=6333
 ```
 
-**Key dataclass chain:** `Article` → `ScreeningResult` (wraps Article) → `AnalysisResult` (flat, doc-ready)
+Qdrant runs in Docker: `docker compose up -d`
+
+---
+
+## Architecture
+
+Data flows top-to-bottom through `pipeline.py → run_pipeline()`. No layer reads back into a previous one.
+
+```
+Layer 1    fetcher/rss_fetcher.py      feedparser → list[Article]
+Layer 1b   fetcher/rss_fetcher.py      trafilatura full-text (ThreadPool, ENRICH_MAX_WORKERS)
+Layer 2    screener/screener_v2.py     BGE-M3 embeddings → Qdrant kNN → RelevanceScorer → list[ScoredArticle]
+Layer 3    analyzer/tiered_dispatcher  ScoredArticle → ScreeningResult → Qwen3.5/OpenAI → list[AnalysisResult]
+Layer 4    generator/doc_generator.py  python-docx → output/briefing_YYYYMMDD_HHMM.docx
+Post-run   data/export_feedback_candidates.py  near-miss audit entries → feedback/candidates.jsonl
+```
+
+**Dataclass chain:** `Article` → `ScoredArticle` → `AnalysisResult`
+
+### Screener v2 internals
+
+```
+Article.title + full_text[:4000]
+    → SentenceTransformer (BAAI/bge-m3, GPU, 1024-dim, normalized)
+    → Qdrant kNN (k=5, label_filter="positive")
+    → _compute_score(): mean cosine sim to top-k positives
+    → _assign_tier(): high ≥0.85 | medium ≥0.55 | low_review ≥threshold | discard
+    → classify_tickers(): weighted vote from neighbor payloads + keyword fallback
+```
+
+Threshold is calibrated by `data/calibrate_threshold.py` (LOO-CV, P5 of positive scores)
+and stored in `config/calibration.json`. All three tiers except `discard` go to LLM analysis.
+
+### Ollama / Qwen3.5 notes
+
+- `"think": False` must be a **top-level** field in the API payload, not inside `options`.
+  Placing it inside `options` is silently ignored by Ollama 0.20.7.
+- `format: "json"` is also top-level. With thinking enabled, `message.content` is empty
+  (tokens exhausted by thinking); only `message.thinking` is populated.
+
+### Document structure (doc_generator.py)
+
+Grouped by sector, then by ticker within the sector:
+```
+Resumo Executivo
+Aeroespacial        → EMBR3
+Automotivo          → POMO4, RAPT4, FRAS3, MYPK3
+Energia e Tecnologia → WEGE3, INTB3
+Outros              → GGPS3, ARML3, MILS3
+Macro / Setorial    → articles with no matched ticker
+```
+
+---
+
+## Key Files
+
+| File | Role |
+|---|---|
+| `config/settings.py` | All settings via pydantic BaseSettings + .env |
+| `config/prompts.py` | LLM prompts — screening (legacy) and analysis |
+| `config/calibration.json` | Generated by calibrate_threshold.py — do not edit manually |
+| `screener/embedding_store.py` | Qdrant wrapper (upsert, kNN search) |
+| `screener/relevance_scorer.py` | Novelty detection scoring + tier assignment |
+| `screener/ticker_classifier.py` | Weighted-vote ticker prediction from neighbors |
+| `screener/screener_v2.py` | Main v2 entry: batch embed → score → audit log |
+| `analyzer/tiered_dispatcher.py` | Routes ScoredArticles to analyze_batch |
+| `analyzer/api_analyzer.py` | Ollama/OpenAI calls with JSON parsing + fallback |
+| `generator/doc_generator.py` | Word document, sector-grouped |
+| `data/ingest_history.py` | ETL: JSONL + feedback/labeled/ → Qdrant |
+| `data/calibrate_threshold.py` | LOO-CV threshold calibration |
+| `data/export_feedback_candidates.py` | Near-miss export from audit logs |
+| `review_feedback.py` | Streamlit labeling app |
+| `feedback/candidates.jsonl` | Near-miss candidates (auto-generated, gitignored) |
+| `feedback/labeled/` | User-reviewed files for ingest (gitignored) |
 
 ## Where to Make Common Changes
 
-| What to change | Where |
+| What | Where |
 |---|---|
 | Add/remove RSS feeds | `config/settings.py` → `RSS_FEEDS` |
-| Add a ticker to coverage | `config/settings.py` → `COVERAGE_UNIVERSE` (add ticker dict with `company`, `sector`, `keywords`) |
-| Add sector keywords for macro filter | `config/settings.py` → `RELEVANT_SECTORS` |
-| Tune GPT analysis prompt | `config/prompts.py` → `ANALYSIS_SYSTEM_PROMPT` / `ANALYSIS_USER_PROMPT` |
-| Tune Ollama screening prompt | `config/prompts.py` → `SCREENING_SYSTEM_PROMPT` / `SCREENING_USER_PROMPT` |
-| Change Word document layout | `generator/doc_generator.py` |
-| Change concurrency limits | `config/settings.py` or `.env` via `API_MAX_WORKERS` / `ENRICH_MAX_WORKERS` |
+| Add ticker to coverage | `config/settings.py` → `COVERAGE_UNIVERSE` + `config/prompts.py` → `ANALYSIS_SYSTEM_PROMPT` + `generator/doc_generator.py` → `SECTOR_GROUPS` |
+| Tune analysis prompt | `config/prompts.py` → `ANALYSIS_SYSTEM_PROMPT` / `ANALYSIS_USER_PROMPT` |
+| Change sector grouping in doc | `generator/doc_generator.py` → `SECTOR_GROUPS` |
+| Change tier boundaries | `screener/relevance_scorer.py` → `TIER_HIGH`, `TIER_MEDIUM` |
+| Change near-miss review range | `data/export_feedback_candidates.py` → `_NEAR_MISS_MIN_OFFSET`, `_NEAR_MISS_MAX_OFFSET` |
+| Switch to OpenAI analysis | `.env` → `ANALYSIS_BACKEND=openai` |
 
-## Screening Logic (Layer 2)
+## Outputs
 
-Two-stage filter in `screen_articles()`:
-1. **Keyword prefilter** — checks `title + full_text[:1000]` against `COVERAGE_UNIVERSE[ticker]["keywords"]` and `RELEVANT_SECTORS`. Free, instant, runs always.
-2. **Ollama LLM** — only called when keyword stage finds sector matches but *no direct ticker match*. Disabled entirely with `--no-llm` or if Ollama has >5 consecutive failures (auto-fallback).
-
-Articles with a direct keyword→ticker match skip the LLM entirely (confidence = 0.95). Ollama results below `SCREENER_CONFIDENCE_THRESHOLD` (0.6) are discarded.
-
-## Parallelism Design
-
-- **Layer 1b** (`enrich_full_text`): `ThreadPoolExecutor(ENRICH_MAX_WORKERS)` — each thread calls `trafilatura.fetch_url()` independently. Articles are mutated in-place (thread-safe because each thread writes to a different object).
-- **Layer 3** (`analyze_batch`): `ThreadPoolExecutor(API_MAX_WORKERS)` — single `OpenAI` client instance shared across threads (thread-safe by design). Each call goes to `_analyze_one()`. Result order is non-deterministic (uses `as_completed`); the document groups by ticker afterward so order doesn't matter.
-- **Layer 2** (Ollama screening): intentionally sequential — Ollama is a single local process and parallel requests don't improve throughput.
-
-## GPT Response Contract
-
-The GPT prompt (`ANALYSIS_USER_PROMPT`) uses `response_format={"type": "json_object"}`, which forces the model to return valid JSON. Expected keys: `tickers`, `summary`, `sentiment` (`"Positivo"/"Negativo"/"Neutro"`), `action_required` (bool), `action_detail` (str|null), `category` (`"company"/"macro_sectoral"`). If parsing fails, `_fallback_analysis()` generates a stub result so the pipeline never crashes on a bad API response.
-
-## Output
-
-- **Document:** `output/briefing_YYYYMMDD_HHMM.docx`
-- **Log:** `output/pipeline_YYYYMMDD.log` (UTF-8, DEBUG level)
-- The log is also mirrored to stdout (INFO level) with a UTF-8 wrapper to handle Windows cp1252 console encoding.
+- **Briefing:** `output/briefing_YYYYMMDD_HHMM.docx`
+- **Log:** `output/pipeline_YYYYMMDD.log` (DEBUG, UTF-8)
+- **Screening audit:** `output/screening_audit_YYYYMMDD.jsonl` — one entry per article with score, tier, tickers, rationale
+- **Feedback candidates:** `feedback/candidates.jsonl` — near-misses for labeling
