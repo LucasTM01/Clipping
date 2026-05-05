@@ -202,17 +202,21 @@ with tab_db:
 
     st.divider()
 
-    # --- Near-miss candidates ---
-    st.subheader("Near-miss Candidates — `feedback/candidates.jsonl`")
+    # --- Candidates (near-miss + aprovados) ---
+    st.subheader("Candidatos para Revisão — `feedback/candidates.jsonl`")
 
     n_cand = len(candidates)
     n_cand_rev = sum(1 for r in candidates if r.get("_reviewed"))
     n_cand_pending = n_cand - n_cand_rev
+    n_approved_cand = sum(1 for r in candidates if r.get("candidate_type") == "approved")
+    n_nearmiss_cand = n_cand - n_approved_cand
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total candidatos", f"{n_cand:,}")
-    c2.metric("Revisados", f"{n_cand_rev:,}")
-    c3.metric("Pendentes", f"{n_cand_pending:,}", delta=f"-{n_cand_pending}" if n_cand_pending else None)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total", f"{n_cand:,}")
+    c2.metric("🟢 Aprovados", f"{n_approved_cand:,}")
+    c3.metric("🟡 Near-miss", f"{n_nearmiss_cand:,}")
+    c4.metric("Revisados", f"{n_cand_rev:,}")
+    c5.metric("Pendentes", f"{n_cand_pending:,}", delta=f"-{n_cand_pending}" if n_cand_pending else None)
 
     if n_cand_pending > 0:
         st.info(f"Há {n_cand_pending} candidatos aguardando revisão. Vá para a aba **🏷️ Revisão**.")
@@ -300,14 +304,15 @@ with tab_review:
 
     st.subheader(f"{status_icon}{record.get('title', '(sem título)')}")
 
+    ctype = record.get("candidate_type", "near_miss")
+    type_badge = "🟢 Aprovado" if ctype == "approved" else "🟡 Near-miss"
+    tier_label = record.get("tier", "—")
+    st.caption(f"{type_badge}  ·  Score: `{record.get('relevance_score', 0):.4f}`  ·  Tier: `{tier_label}`")
+
     meta_col1, meta_col2, meta_col3 = st.columns(3)
     meta_col1.markdown(f"**Fonte:** {record.get('source', '—')}")
     meta_col2.markdown(f"**Data:** {record.get('date', '—')}")
-    meta_col3.markdown(f"**Score:** `{record.get('relevance_score', 0):.4f}`")
-
-    tickers = record.get("predicted_tickers", [])
-    if tickers:
-        st.markdown(f"**Tickers previstos:** {' · '.join(f'`{t}`' for t in tickers)}")
+    meta_col3.markdown(f"**Tickers:** {', '.join(record.get('predicted_tickers', [])) or '—'}")
 
     url = record.get("url", "")
     if url:
@@ -346,25 +351,41 @@ with tab_review:
     with st.sidebar:
         st.header("Navegação")
 
+        filter_type = st.radio(
+            "Tipo",
+            ["Todos", "🟢 Aprovados", "🟡 Near-miss"],
+            index=0,
+        )
+
         filter_opt = st.radio(
-            "Mostrar",
+            "Status",
             ["Todos", "Não revisados", "Relevantes", "Irrelevantes"],
             index=1,
         )
 
-        if filter_opt == "Não revisados":
-            visible = [i for i, r in enumerate(records) if not r.get("_reviewed")]
-        elif filter_opt == "Relevantes":
-            visible = [i for i, r in enumerate(records) if r.get("relevant_yes_no") is True]
-        elif filter_opt == "Irrelevantes":
-            visible = [i for i, r in enumerate(records) if r.get("relevant_yes_no") is False]
+        # Aplica filtro de tipo
+        if filter_type == "🟢 Aprovados":
+            type_filtered = [i for i, r in enumerate(records) if r.get("candidate_type") == "approved"]
+        elif filter_type == "🟡 Near-miss":
+            type_filtered = [i for i, r in enumerate(records) if r.get("candidate_type", "near_miss") == "near_miss"]
         else:
-            visible = list(range(total))
+            type_filtered = list(range(total))
+
+        # Aplica filtro de status sobre o resultado do filtro de tipo
+        if filter_opt == "Não revisados":
+            visible = [i for i in type_filtered if not records[i].get("_reviewed")]
+        elif filter_opt == "Relevantes":
+            visible = [i for i in type_filtered if records[i].get("relevant_yes_no") is True]
+        elif filter_opt == "Irrelevantes":
+            visible = [i for i in type_filtered if records[i].get("relevant_yes_no") is False]
+        else:
+            visible = type_filtered
 
         if visible:
             titles = [
                 f"{'✅' if records[i].get('relevant_yes_no') is True else '❌' if records[i].get('relevant_yes_no') is False else '⬜'} "
-                f"{records[i].get('title', '')[:50]}..."
+                f"{'🟢' if records[i].get('candidate_type') == 'approved' else '🟡'} "
+                f"{records[i].get('title', '')[:45]}..."
                 for i in visible
             ]
             chosen = st.selectbox("Ir para artigo", range(len(visible)), format_func=lambda x: titles[x])

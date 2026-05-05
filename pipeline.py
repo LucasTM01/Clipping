@@ -20,7 +20,7 @@ from screener.screener_v2 import screen_articles_v2
 from analyzer.api_analyzer import analyze_batch
 from analyzer.tiered_dispatcher import dispatch_batch
 from generator.doc_generator import generate_briefing
-from data.export_feedback_candidates import export_candidates
+from data.export_feedback_candidates import export_candidates, export_approved
 
 logger = logging.getLogger(__name__)
 
@@ -113,14 +113,21 @@ def run_pipeline(
     n_relevant = len(scored) if not use_legacy_screener else len(screenings)
     _log_summary(start_time, len(articles), n_relevant, len(analyses), output_path)
 
-    # Feedback loop: acumula near-miss candidates do audit log para revisão
+    # Feedback loop: acumula near-miss e aprovados do audit log para revisão no Streamlit
     if not use_legacy_screener:
         try:
             n_candidates = export_candidates()
             if n_candidates:
                 logger.info(f"Feedback: {n_candidates} novos near-miss candidates -> feedback/candidates.jsonl")
         except Exception as e:
-            logger.warning(f"Feedback export falhou (não crítico): {e}")
+            logger.warning(f"Feedback near-miss export falhou (não crítico): {e}")
+
+        try:
+            n_approved = export_approved()
+            if n_approved:
+                logger.info(f"Feedback: {n_approved} artigos aprovados -> feedback/candidates.jsonl")
+        except Exception as e:
+            logger.warning(f"Feedback approved export falhou (não crítico): {e}")
 
     return output_path
 
