@@ -29,8 +29,8 @@ CALIBRATION_PATH = Path(__file__).parent.parent / "config" / "calibration.json"
 # Score fora desse range não vale revisar:
 # - Abaixo do mínimo: claramente irrelevante
 # - Acima do máximo: já entrou no briefing como low_review ou melhor
-_NEAR_MISS_MIN_OFFSET = -0.15   # threshold - 0.15
-_NEAR_MISS_MAX_OFFSET = +0.05   # threshold + 0.05
+_NEAR_MISS_MIN_OFFSET = -0.05   # threshold - 0.05
+_NEAR_MISS_MAX_OFFSET = +0.35   # threshold + 0.35
 _ABSOLUTE_MIN = 0.25
 
 

@@ -48,6 +48,27 @@ class Settings(BaseSettings):
     document_title: str = "Briefing de Mercado — Equity Research"
     document_subtitle: str = "Capital Goods & Industrials"
 
+    # Scrapers (non-RSS)
+    scraper_max_pages: int = 10
+    scraper_concurrency: int = 4
+
+    # Bloomberg: industry pages are curated digests, not daily feeds — use
+    # a wider lookback so articles aren't silently skipped on quiet weeks.
+    bloomberg_lookback_hours: int = 336  # 14 days
+
+    # Proprietary news database (SQLite)
+    news_db_path: str = "output/news_database.db"
+
+    # Email notifications
+    email_enabled: bool = False
+    email_smtp_host: str = "smtp.gmail.com"
+    email_smtp_port: int = 587
+    email_username: str = ""
+    email_password: str = ""          # App Password do Google (não a senha normal)
+    email_from: str = ""
+    email_briefing_to: list[str] = ["lucas.melotti@safra.com.br", "lucas.melotti.safra@gmail.com"]
+    email_ops_to: list[str] = ["lucas.melotti.safra@gmail.com"]
+
     @model_validator(mode="after")
     def _validate_openai(self) -> "Settings":
         if self.analysis_backend == "openai" and not self.openai_api_key:
@@ -81,6 +102,27 @@ SCREENER_SNIPPET_LENGTH = settings.screener_snippet_length
 MAX_ARTICLE_AGE_HOURS = settings.max_article_age_hours
 DOCUMENT_TITLE = settings.document_title
 DOCUMENT_SUBTITLE = settings.document_subtitle
+SCRAPER_MAX_PAGES = settings.scraper_max_pages
+SCRAPER_CONCURRENCY = settings.scraper_concurrency
+BLOOMBERG_LOOKBACK_HOURS = settings.bloomberg_lookback_hours
+
+# --- Scrapers habilitados (nomes em lowercase, devem casar com BaseScraper.name) ---
+SCRAPERS_ENABLED = [
+    "aeroin",
+    "airway",
+    "autodata",
+    "automotive business",
+    "brazil journal",
+    "canal solar",
+    "infomoney",
+    "oglobo",
+    "portal solar",
+    "reuters aerospace & defense",
+    "reuters autos & transportation",
+    "reuters energy",
+    "bloomberg transportation",
+    "bloomberg energy",
+]
 
 # --- Feeds RSS ---
 RSS_FEEDS = [
@@ -113,7 +155,24 @@ RSS_FEEDS = [
         "name": "Financial Times Brazil",
         "url": "https://www.ft.com/brazil?format=rss",
         "language": "en",
+        "lookback_hours": 336,  # curated stream, low publication frequency
     },
+    {
+        "name": "CNN",
+        "url": "https://admin.cnnbrasil.com.br/feed/",
+        "language": "pt-br",
+    },
+    {
+        "name": "Folha Mercados",
+        "url": "https://feeds.folha.uol.com.br/mercado/rss091.xml",
+        "language": "pt-br",
+    },
+    {
+        "name": "Folha Mundo",
+        "url": "https://feeds.folha.uol.com.br/mundo/rss091.xml",
+        "language": "pt-br",
+    },
+
 ]
 
 # --- Universo de Cobertura ---

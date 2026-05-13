@@ -105,15 +105,14 @@ def _sentiment_indicator(sentiment: str) -> str:
 
 
 def _add_news_item(doc: Document, analysis: AnalysisResult) -> None:
-    """Adiciona um item de notícia ao documento."""
-    # Título da notícia com sentimento
+    """Adiciona um item de notícia ao documento — título, fonte/data e link."""
     indicator = _sentiment_indicator(analysis.sentiment)
+
+    # Título com indicador de sentimento
     title_para = doc.add_paragraph()
     run = title_para.add_run(f"{indicator} {analysis.title}")
     run.bold = True
     run.font.size = Pt(10)
-
-    # Sentimento colorido
     if analysis.sentiment == "Positivo":
         run.font.color.rgb = RGBColor(0, 128, 0)
     elif analysis.sentiment == "Negativo":
@@ -121,31 +120,15 @@ def _add_news_item(doc: Document, analysis: AnalysisResult) -> None:
     else:
         run.font.color.rgb = RGBColor(64, 64, 64)
 
-    # Fonte e data
+    # Fonte, data e link numa linha só
     meta_para = doc.add_paragraph()
-    run = meta_para.add_run(f"Fonte: {analysis.source} | {analysis.published_at[:10]}")
-    run.font.size = Pt(8)
-    run.font.color.rgb = RGBColor(150, 150, 150)
-
-    # Síntese
-    summary_para = doc.add_paragraph()
-    run = summary_para.add_run(analysis.summary)
-    run.font.size = Pt(10)
-
-    # Flag de ação requerida
-    if analysis.action_required:
-        action_para = doc.add_paragraph()
-        run = action_para.add_run(f">> ACAO REQUERIDA: {analysis.action_detail or 'Revisão necessária'}")
-        run.bold = True
-        run.font.size = Pt(9)
-        run.font.color.rgb = RGBColor(192, 0, 0)
-
-    # Link
-    link_para = doc.add_paragraph()
-    run = link_para.add_run(analysis.url)
-    run.font.size = Pt(8)
-    run.font.color.rgb = RGBColor(0, 102, 204)
-    run.underline = True
+    meta_run = meta_para.add_run(f"{analysis.source} | {analysis.published_at[:10]} | ")
+    meta_run.font.size = Pt(8)
+    meta_run.font.color.rgb = RGBColor(150, 150, 150)
+    link_run = meta_para.add_run(analysis.url)
+    link_run.font.size = Pt(8)
+    link_run.font.color.rgb = RGBColor(0, 102, 204)
+    link_run.underline = True
 
 
 def _add_summary_table(doc: Document, analyses: list[AnalysisResult]) -> None:

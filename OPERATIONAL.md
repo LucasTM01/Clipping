@@ -58,6 +58,12 @@ ollama list   # deve mostrar qwen3.5:9b na lista
 # 2. Rodar
 python main.py
 ```
+**1. Rodar o app de revisão**
+
+```powershell
+.venv\Scripts\activate
+streamlit run review_feedback.py
+```
 
 O pipeline leva entre 15–30 minutos dependendo do volume de notícias do dia.
 O briefing é salvo automaticamente em `output/`.

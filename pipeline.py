@@ -11,16 +11,19 @@ Executa todas as camadas em sequência:
 
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from config.settings import MAX_ARTICLE_AGE_HOURS
 from fetcher.rss_fetcher import fetch_all_feeds, enrich_full_text
+from scrapers.registry import fetch_all_scrapers
 from screener.local_llm import screen_articles
 from screener.screener_v2 import screen_articles_v2
 from analyzer.api_analyzer import analyze_batch
 from analyzer.tiered_dispatcher import dispatch_batch
 from generator.doc_generator import generate_briefing
 from data.export_feedback_candidates import export_candidates, export_approved
+from notifier.email_sender import PipelineStats
 
 logger = logging.getLogger(__name__)
 
@@ -65,69 +68,125 @@ def run_pipeline(
     """
     setup_logging(verbose)
     start_time = datetime.now()
+    stats = PipelineStats(started_at=start_time)
 
     logger.info("=" * 60)
     logger.info("PIPELINE DE CLIPPING — EQUITY RESEARCH")
     logger.info(f"Execução: {start_time.strftime('%d/%m/%Y %H:%M:%S')}")
     logger.info("=" * 60)
 
-    # --- Camada 1: Coleta ---
-    logger.info("--- CAMADA 1: Coleta de feeds RSS ---")
-    articles = fetch_all_feeds()
+    try:
+        # --- Camada 1: Coleta ---
+        logger.info("--- CAMADA 1: Coleta de feeds RSS ---")
+        articles = fetch_all_feeds()
 
-    if not articles:
-        logger.warning("Nenhum artigo coletado. Verifique conectividade e feeds.")
-        return None
-
-    # --- Camada 1b: Enriquecimento ---
-    if enrich_text:
-        logger.info("--- CAMADA 1b: Enriquecimento de texto ---")
-        articles = enrich_full_text(articles)
-
-    # --- Camada 2: Triagem ---
-    if use_legacy_screener:
-        logger.info("--- CAMADA 2: Triagem de relevância (legacy: keyword + Ollama) ---")
-        screenings = screen_articles(articles, use_llm=use_llm_screener)
-        if not screenings:
-            logger.info("Nenhum artigo relevante identificado. Gerando documento vazio.")
-            output_path = generate_briefing([])
-            _log_summary(start_time, len(articles), 0, 0, output_path)
-            return output_path
-        logger.info("--- CAMADA 3: Análise e sumarização (legacy) ---")
-        analyses = analyze_batch(screenings)
-    else:
-        logger.info("--- CAMADA 2: Triagem de relevância (v2: BGE-M3 + Qdrant) ---")
-        scored = screen_articles_v2(articles)
-        if not scored:
-            logger.info("Nenhum artigo relevante identificado. Gerando documento vazio.")
-            output_path = generate_briefing([])
-            _log_summary(start_time, len(articles), 0, 0, output_path)
-            return output_path
-        logger.info("--- CAMADA 3: Análise e sumarização (tiered dispatcher) ---")
-        analyses = dispatch_batch(scored)
-
-    # --- Camada 4: Documento ---
-    logger.info("--- CAMADA 4: Geração do documento ---")
-    output_path = generate_briefing(analyses)
-
-    n_relevant = len(scored) if not use_legacy_screener else len(screenings)
-    _log_summary(start_time, len(articles), n_relevant, len(analyses), output_path)
-
-    # Feedback loop: acumula near-miss e aprovados do audit log para revisão no Streamlit
-    if not use_legacy_screener:
+        # --- Camada 1c: Scrapers (sites sem RSS) ---
+        logger.info("--- CAMADA 1c: Scrapers (sites sem RSS) ---")
+        since = datetime.now(timezone.utc) - timedelta(hours=MAX_ARTICLE_AGE_HOURS)
         try:
-            n_candidates = export_candidates()
-            if n_candidates:
-                logger.info(f"Feedback: {n_candidates} novos near-miss candidates -> feedback/candidates.jsonl")
+            scraped = fetch_all_scrapers(since)
         except Exception as e:
-            logger.warning(f"Feedback near-miss export falhou (não crítico): {e}")
+            logger.error(f"Scrapers falharam (não crítico): {e}", exc_info=True)
+            scraped = []
+        articles.extend(scraped)
 
-        try:
-            n_approved = export_approved()
-            if n_approved:
-                logger.info(f"Feedback: {n_approved} artigos aprovados -> feedback/candidates.jsonl")
-        except Exception as e:
-            logger.warning(f"Feedback approved export falhou (não crítico): {e}")
+        # Collect per-source fetch counts
+        for a in articles:
+            stats.ensure_source(a.source).n_fetched += 1
+        stats.n_fetched = len(articles)
+
+        if not articles:
+            logger.warning("Nenhum artigo coletado. Verifique conectividade e feeds.")
+            stats.error = "Nenhum artigo coletado"
+            return None
+
+        # --- Camada 1b: Enriquecimento ---
+        if enrich_text:
+            logger.info("--- CAMADA 1b: Enriquecimento de texto ---")
+            articles = enrich_full_text(articles)
+
+        # --- Camada 2: Triagem ---
+        if use_legacy_screener:
+            logger.info("--- CAMADA 2: Triagem de relevância (legacy: keyword + Ollama) ---")
+            screenings = screen_articles(articles, use_llm=use_llm_screener)
+            if not screenings:
+                logger.info("Nenhum artigo relevante identificado. Gerando documento vazio.")
+                output_path = generate_briefing([])
+                _log_summary(start_time, len(articles), 0, 0, output_path)
+                return output_path
+            logger.info("--- CAMADA 3: Análise e sumarização (legacy) ---")
+            analyses = analyze_batch(screenings)
+            scored = []
+        else:
+            logger.info("--- CAMADA 2: Triagem de relevância (v2: BGE-M3 + Qdrant) ---")
+            scored = screen_articles_v2(articles)
+
+            # Collect screening stats
+            for s in scored:
+                src = stats.ensure_source(s.article.source)
+                src.tier_counts[s.tier] += 1
+                stats.tier_counts[s.tier] = stats.tier_counts.get(s.tier, 0) + 1
+                if s.tier != "discard":
+                    src.n_approved += 1
+                    src.scores.append(s.relevance_score)
+
+            if not scored:
+                logger.info("Nenhum artigo relevante identificado. Gerando documento vazio.")
+                output_path = generate_briefing([])
+                _log_summary(start_time, len(articles), 0, 0, output_path)
+                return output_path
+            logger.info("--- CAMADA 3: Análise e sumarização (tiered dispatcher) ---")
+            analyses = dispatch_batch(scored)
+
+        # Collect analysis stats
+        for a in analyses:
+            stats.sentiment_counts[a.sentiment] = (
+                stats.sentiment_counts.get(a.sentiment, 0) + 1
+            )
+            if a.action_required:
+                stats.n_action_required += 1
+            stats.ensure_source(a.source).n_analyzed += 1
+        stats.n_analyzed = len(analyses)
+
+        # --- Camada 4: Documento ---
+        logger.info("--- CAMADA 4: Geração do documento ---")
+        output_path = generate_briefing(analyses)
+        stats.docx_path = str(output_path)
+
+        n_relevant = len(scored) if not use_legacy_screener else len(screenings)
+        _log_summary(start_time, len(articles), n_relevant, len(analyses), output_path)
+
+        # Feedback loop
+        if not use_legacy_screener:
+            try:
+                n_cand = export_candidates()
+                if n_cand:
+                    logger.info(f"Feedback: {n_cand} novos near-miss candidates -> feedback/candidates.jsonl")
+            except Exception as e:
+                logger.warning(f"Feedback near-miss export falhou (não crítico): {e}")
+
+            try:
+                n_appr = export_approved()
+                if n_appr:
+                    logger.info(f"Feedback: {n_appr} artigos aprovados -> feedback/candidates.jsonl")
+            except Exception as e:
+                logger.warning(f"Feedback approved export falhou (não crítico): {e}")
+
+    except Exception as exc:
+        stats.error = str(exc)
+        logger.error(f"Pipeline falhou: {exc}", exc_info=True)
+        output_path = None
+        analyses = []
+
+    # --- Notificações por email ---
+    stats.finished_at = datetime.now()
+    from config.settings import settings as _settings
+    if _settings.email_enabled:
+        logger.info("--- Enviando emails ---")
+        from notifier.email_sender import send_briefing_email, send_ops_report
+        if analyses:
+            send_briefing_email(analyses, _settings.email_briefing_to)
+        send_ops_report(stats, _settings.email_ops_to)
 
     return output_path
 

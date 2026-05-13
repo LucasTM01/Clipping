@@ -93,6 +93,27 @@ def export_labeled(records: list[dict]) -> Path:
     return out_path
 
 
+@st.cache_data(ttl=120)
+def load_audit_logs() -> list[dict]:
+    records = []
+    for path in sorted(Path("output").glob("screening_audit_*.jsonl")):
+        date_str = path.stem.replace("screening_audit_", "")  # YYYYMMDD
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            r = json.loads(line)
+                            r["_run_date"] = date_str
+                            records.append(r)
+                        except json.JSONDecodeError:
+                            pass
+        except OSError:
+            pass
+    return records
+
+
 def get_qdrant_count() -> int | None:
     try:
         from qdrant_client import QdrantClient
@@ -107,7 +128,7 @@ def get_qdrant_count() -> int | None:
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_db, tab_review = st.tabs(["📊 Base de Dados", "🏷️ Revisão"])
+tab_db, tab_review, tab_stats = st.tabs(["📊 Base de Dados", "🏷️ Revisão", "📈 Estatísticas"])
 
 
 # ============================================================
@@ -119,7 +140,7 @@ with tab_db:
 
     col_refresh, _ = st.columns([1, 5])
     with col_refresh:
-        if st.button("🔄 Atualizar", use_container_width=True):
+        if st.button("🔄 Atualizar", width="stretch"):
             st.cache_data.clear()
             st.rerun()
 
@@ -255,14 +276,13 @@ with tab_review:
 
     st.divider()
 
+    _review_active = total > 0 and remaining > 0
+
     if total == 0:
         st.warning("Nenhum candidato encontrado em `feedback/candidates.jsonl`.")
         st.info("Execute o pipeline primeiro: `python main.py --no-enrich`")
-        st.stop()
-
-    if remaining == 0:
+    elif remaining == 0:
         st.success("Todos os artigos foram revisados!")
-        st.balloons()
         if st.button("Exportar para feedback/labeled/ e preparar ingest", type="primary"):
             out = export_labeled(records)
             st.success(f"Exportado: `{out}`")
@@ -271,8 +291,9 @@ with tab_review:
                 "python -m data.calibrate_threshold",
                 language="bash",
             )
-        st.stop()
 
+if _review_active:
+  with tab_review:
     idx = st.session_state.index
     if idx >= total:
         idx = 0
@@ -283,7 +304,7 @@ with tab_review:
     # Navigation
     nav_col1, nav_col2, nav_col3 = st.columns([1, 3, 1])
     with nav_col1:
-        if st.button("← Anterior", use_container_width=True):
+        if st.button("← Anterior", width="stretch"):
             st.session_state.index = max(0, idx - 1)
             st.rerun()
     with nav_col2:
@@ -293,7 +314,7 @@ with tab_review:
             unsafe_allow_html=True,
         )
     with nav_col3:
-        if st.button("Próximo →", use_container_width=True):
+        if st.button("Próximo →", width="stretch"):
             st.session_state.index = min(total - 1, idx + 1)
             st.rerun()
 
@@ -329,21 +350,34 @@ with tab_review:
         records[idx]["relevant_yes_no"] = relevant
         records[idx]["_reviewed"] = True
         save_candidates(records)
+        if relevant is not None:
+            article_url = records[idx].get("url", "")
+            if article_url:
+                try:
+                    from data.news_db import update_capital_goods
+                    update_capital_goods(article_url, value=1 if relevant else 0)
+                except Exception:
+                    pass
         unreviewed = [i for i, r in enumerate(records) if not r.get("_reviewed")]
-        st.session_state.index = unreviewed[0] if unreviewed else idx + 1
-        st.rerun()
+        after = [i for i in unreviewed if i > idx]
+        if after:
+            st.session_state.index = after[0]
+        elif unreviewed:
+            st.session_state.index = unreviewed[0]
+        # else: stay at idx (all reviewed)
+        # Note: no st.rerun() here — Streamlit reruns automatically after on_click callbacks
 
     btn1, btn2, btn3 = st.columns(3)
     with btn1:
-        st.button("✅ Relevante", use_container_width=True, type="primary",
+        st.button("✅ Relevante", width="stretch", type="primary",
                   on_click=_label, args=(True,),
                   help="Artigo É relevante — o screener errou ao descartar")
     with btn2:
-        st.button("❌ Não Relevante", use_container_width=True,
+        st.button("❌ Não Relevante", width="stretch",
                   on_click=_label, args=(False,),
                   help="Artigo NÃO é relevante — confirma o descarte")
     with btn3:
-        if st.button("⏭ Pular", use_container_width=True, help="Revisar depois"):
+        if st.button("⏭ Pular", width="stretch", help="Revisar depois"):
             st.session_state.index = min(total - 1, idx + 1)
             st.rerun()
 
@@ -395,7 +429,7 @@ with tab_review:
 
         st.divider()
         st.header("Exportar")
-        if st.button("Salvar para labeled/", use_container_width=True):
+        if st.button("Salvar para labeled/", width="stretch"):
             out = export_labeled(records)
             st.success(f"Salvo em:\n`{out}`")
             st.code(
@@ -403,3 +437,434 @@ with tab_review:
                 "python -m data.calibrate_threshold",
                 language="bash",
             )
+
+
+# ============================================================
+# TAB 3 — ESTATÍSTICAS / DASHBOARD
+# ============================================================
+
+
+def _build_audit_df(records: list[dict]):
+    """Defensive DataFrame construction — guarantees expected columns/dtypes."""
+    import pandas as pd
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    defaults = {
+        "source": "",
+        "tier": "",
+        "title": "",
+        "url": "",
+        "rationale": "",
+        "relevance_score": 0.0,
+        "sent_to_analysis": False,
+        "predicted_tickers": None,
+    }
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+
+    df["date"] = pd.to_datetime(df["_run_date"], format="%Y%m%d", errors="coerce")
+    if "timestamp" in df.columns:
+        df["ts"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    else:
+        df["ts"] = df["date"]
+
+    df["source"] = df["source"].fillna("").astype(str).replace("", "(desconhecido)")
+    df["tier"] = df["tier"].fillna("").astype(str).replace("", "discard")
+    df["sent_to_analysis"] = df["sent_to_analysis"].fillna(False).astype(bool)
+    df["relevance_score"] = pd.to_numeric(df["relevance_score"], errors="coerce").fillna(0.0)
+
+    df = df.dropna(subset=["date"]).copy()
+    return df
+
+
+def _section(title: str, render):
+    """Wrap a dashboard section in its own try/except."""
+    try:
+        render()
+    except Exception as exc:
+        st.error(f"❌ Falha em '{title}': {exc}")
+
+
+with tab_stats:
+    st.title("📈 Dashboard — Saúde do Pipeline")
+    st.caption("Histórico de coleta, screening e detecção de problemas de scraping")
+
+    col_refresh2, _ = st.columns([1, 5])
+    with col_refresh2:
+        if st.button("🔄 Atualizar", width="stretch", key="refresh_stats"):
+            st.cache_data.clear()
+            st.rerun()
+
+    audit_records = load_audit_logs()
+    if not audit_records:
+        st.warning("Nenhum `output/screening_audit_*.jsonl` encontrado. Execute o pipeline primeiro.")
+        st.stop()
+
+    try:
+        import pandas as pd
+        import numpy as np
+    except ImportError as exc:
+        st.error(f"Dependência faltando: {exc}")
+        st.stop()
+
+    df_full = _build_audit_df(audit_records)
+    if df_full.empty:
+        st.warning("Audit logs vazios após parsing.")
+        st.stop()
+
+    # --- Date range filter ---
+    min_d = df_full["date"].min().date()
+    max_d = df_full["date"].max().date()
+    if min_d == max_d:
+        date_range = (min_d, max_d)
+        st.caption(f"Período disponível: **{min_d}** (apenas 1 dia)")
+    else:
+        date_range = st.slider(
+            "Período",
+            min_value=min_d,
+            max_value=max_d,
+            value=(min_d, max_d),
+            format="YYYY-MM-DD",
+        )
+
+    mask = (df_full["date"].dt.date >= date_range[0]) & (df_full["date"].dt.date <= date_range[1])
+    df = df_full[mask].copy()
+
+    if df.empty:
+        st.warning("Nenhum registro no período selecionado.")
+        st.stop()
+
+    # =========================================================
+    # KPIs
+    # =========================================================
+    def _render_kpis():
+        n_dias = df["date"].nunique()
+        n_total = len(df)
+        n_fontes = df["source"].nunique()
+        n_analisados = int(df["sent_to_analysis"].sum())
+        approval_rate = (n_analisados / n_total * 100) if n_total else 0
+        avg_per_day = n_total / n_dias if n_dias else 0
+        last_run = df["date"].max().strftime("%Y-%m-%d")
+
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("📅 Dias", n_dias)
+        m2.metric("📰 Total artigos", f"{n_total:,}")
+        m3.metric("🌐 Fontes", n_fontes)
+        m4.metric("📊 Média/dia", f"{avg_per_day:,.0f}")
+        m5.metric("🤖 Enviados ao LLM", f"{n_analisados}", delta=f"{approval_rate:.1f}%")
+        m6.metric("🕐 Último run", last_run)
+
+    _section("KPIs", _render_kpis)
+    st.divider()
+
+    # =========================================================
+    # ALERTAS DE SAÚDE DO SCRAPING
+    # =========================================================
+    def _render_alerts():
+        st.subheader("🚨 Alertas de saúde do scraping")
+        st.caption(
+            "Compara últimos 3 dias vs. histórico para detectar fontes que pararam de coletar "
+            "ou caíram drasticamente em volume."
+        )
+
+        last_global_date = df_full["date"].max()
+        cutoff_recent = last_global_date - pd.Timedelta(days=3)
+
+        per_source = (
+            df_full.groupby("source")
+            .agg(
+                total=("source", "size"),
+                ultimo=("date", "max"),
+                dias_ativos=("date", "nunique"),
+            )
+            .reset_index()
+        )
+
+        # Média histórica por dia ativo
+        daily = df_full.groupby(["source", "date"]).size().reset_index(name="cnt")
+        hist_avg = daily.groupby("source")["cnt"].mean().rename("media_hist")
+
+        # Média recente (últimos 3 dias do dataset)
+        recent = (
+            daily[daily["date"] >= cutoff_recent]
+            .groupby("source")["cnt"]
+            .mean()
+            .rename("media_recente")
+        )
+
+        per_source = per_source.merge(hist_avg, on="source", how="left")
+        per_source = per_source.merge(recent, on="source", how="left")
+        per_source["media_recente"] = per_source["media_recente"].fillna(0)
+
+        per_source["dias_sem_aparecer"] = (last_global_date - per_source["ultimo"]).dt.days
+        per_source["queda_pct"] = np.where(
+            per_source["media_hist"] > 0,
+            (1 - per_source["media_recente"] / per_source["media_hist"]) * 100,
+            0,
+        )
+
+        # Classifica
+        def _status(row):
+            if row["dias_ativos"] < 2:
+                return "⚪ Pouca data"
+            if row["dias_sem_aparecer"] >= 7:
+                return "🔴 Inativa (>7d)"
+            if row["dias_sem_aparecer"] >= 3:
+                return "🟠 Sem registros (3-6d)"
+            if row["queda_pct"] >= 60 and row["media_hist"] >= 5:
+                return "🟡 Volume caiu >60%"
+            return "🟢 OK"
+
+        per_source["status"] = per_source.apply(_status, axis=1)
+
+        critical = per_source[per_source["status"].isin(
+            ["🔴 Inativa (>7d)", "🟠 Sem registros (3-6d)", "🟡 Volume caiu >60%"]
+        )].sort_values(["status", "media_hist"], ascending=[True, False])
+
+        if critical.empty:
+            st.success("✅ Todas as fontes ativas estão operando dentro do esperado.")
+        else:
+            st.warning(f"⚠️ {len(critical)} fonte(s) requerem atenção:")
+            display = critical[[
+                "status", "source", "ultimo", "dias_sem_aparecer",
+                "media_hist", "media_recente", "queda_pct", "total",
+            ]].copy()
+            display.columns = [
+                "Status", "Fonte", "Última coleta", "Dias parada",
+                "Média hist./dia", "Média 3d", "Queda %", "Total",
+            ]
+            display["Última coleta"] = display["Última coleta"].dt.strftime("%Y-%m-%d")
+            display["Média hist./dia"] = display["Média hist./dia"].round(1)
+            display["Média 3d"] = display["Média 3d"].round(1)
+            display["Queda %"] = display["Queda %"].round(0).astype(int).astype(str) + "%"
+            st.dataframe(display, width="stretch", hide_index=True)
+
+    _section("Alertas", _render_alerts)
+    st.divider()
+
+    # =========================================================
+    # FUNIL DE CONVERSÃO
+    # =========================================================
+    def _render_funnel():
+        st.subheader("🔄 Funil de conversão")
+        n_total = len(df)
+        n_not_discard = int((df["tier"] != "discard").sum())
+        n_sent = int(df["sent_to_analysis"].sum())
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Coletados", f"{n_total:,}", help="Total de artigos que passaram pelo screener")
+        c2.metric(
+            "Aprovados (não-discard)",
+            f"{n_not_discard:,}",
+            delta=f"{n_not_discard/n_total*100:.1f}%" if n_total else None,
+        )
+        c3.metric(
+            "Enviados ao LLM",
+            f"{n_sent:,}",
+            delta=f"{n_sent/n_total*100:.1f}%" if n_total else None,
+        )
+
+    _section("Funil", _render_funnel)
+    st.divider()
+
+    # =========================================================
+    # VOLUME DIÁRIO
+    # =========================================================
+    def _render_volume():
+        st.subheader("📊 Volume diário")
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            st.markdown("**Total de artigos coletados por dia**")
+            daily_total = df.groupby("date").size().reset_index(name="artigos")
+            daily_total = daily_total.set_index("date")
+            st.line_chart(daily_total, height=280)
+
+        with col_b:
+            st.markdown("**Por tier (área empilhada)**")
+            tier_daily = (
+                df.groupby(["date", "tier"]).size().unstack(fill_value=0).sort_index()
+            )
+            preferred_order = ["high", "medium", "low_review", "discard"]
+            ordered_cols = [c for c in preferred_order if c in tier_daily.columns]
+            ordered_cols += [c for c in tier_daily.columns if c not in preferred_order]
+            tier_daily = tier_daily[ordered_cols]
+            st.area_chart(tier_daily, height=280)
+
+    _section("Volume diário", _render_volume)
+    st.divider()
+
+    # =========================================================
+    # SAÚDE POR FONTE — TABELA DETALHADA
+    # =========================================================
+    def _render_source_table():
+        st.subheader("🌐 Saúde por fonte")
+        st.caption("Volume, qualidade e atividade — clique nas colunas para ordenar")
+
+        last_d = df_full["date"].max()
+        per_source = (
+            df.groupby("source")
+            .agg(
+                total=("source", "size"),
+                dias_ativos=("date", "nunique"),
+                aprovados=("sent_to_analysis", "sum"),
+                score_medio=("relevance_score", "mean"),
+                ultimo=("date", "max"),
+            )
+            .reset_index()
+        )
+        per_source["aprovados"] = per_source["aprovados"].astype(int)
+        per_source["taxa_aprov"] = (
+            per_source["aprovados"] / per_source["total"] * 100
+        ).round(1)
+        per_source["media_dia"] = (
+            per_source["total"] / per_source["dias_ativos"]
+        ).round(1)
+        per_source["dias_parada"] = (last_d - per_source["ultimo"]).dt.days
+        per_source["score_medio"] = per_source["score_medio"].round(3)
+
+        per_source = per_source.sort_values("total", ascending=False)
+        display = per_source[[
+            "source", "total", "media_dia", "dias_ativos",
+            "aprovados", "taxa_aprov", "score_medio", "ultimo", "dias_parada",
+        ]].copy()
+        display.columns = [
+            "Fonte", "Total", "Média/dia", "Dias ativos",
+            "→LLM", "Taxa aprov %", "Score médio", "Última coleta", "Dias parada",
+        ]
+        display["Última coleta"] = display["Última coleta"].dt.strftime("%Y-%m-%d")
+        st.dataframe(display, width="stretch", hide_index=True, height=400)
+
+    _section("Saúde por fonte", _render_source_table)
+    st.divider()
+
+    # =========================================================
+    # HEATMAP FONTE × DIA — visual gaps
+    # =========================================================
+    def _render_heatmap():
+        st.subheader("🗓️ Atividade fonte × dia")
+        st.caption("Quadrados em branco = fonte não produziu nada naquele dia (potencial falha)")
+
+        try:
+            import altair as alt
+        except ImportError:
+            st.info("Altair não disponível — pulando heatmap.")
+            return
+
+        # Limita a top 20 fontes para legibilidade
+        top_sources = df["source"].value_counts().head(20).index.tolist()
+        sub = df[df["source"].isin(top_sources)]
+
+        heat = (
+            sub.groupby(["source", "date"]).size().reset_index(name="artigos")
+        )
+        heat["date_str"] = heat["date"].dt.strftime("%Y-%m-%d")
+
+        chart = (
+            alt.Chart(heat)
+            .mark_rect()
+            .encode(
+                x=alt.X("date_str:O", title="Dia", axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y("source:N", title="Fonte", sort=top_sources),
+                color=alt.Color(
+                    "artigos:Q",
+                    scale=alt.Scale(scheme="viridis"),
+                    legend=alt.Legend(title="Artigos"),
+                ),
+                tooltip=["source", "date_str", "artigos"],
+            )
+            .properties(height=max(300, len(top_sources) * 22))
+        )
+        st.altair_chart(chart, width="stretch")
+
+    _section("Heatmap", _render_heatmap)
+    st.divider()
+
+    # =========================================================
+    # TOP FONTES — VOLUME E QUALIDADE
+    # =========================================================
+    def _render_top_sources():
+        st.subheader("🏆 Top fontes")
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            st.markdown("**Por volume (top 15)**")
+            vol = df["source"].value_counts().head(15).rename("artigos")
+            st.bar_chart(vol, height=400)
+
+        with col_b:
+            st.markdown("**Por qualidade — % não-discard (mín. 20 artigos)**")
+            grp = df.groupby("source").agg(
+                total=("source", "size"),
+                bons=("tier", lambda s: (s != "discard").sum()),
+            )
+            grp = grp[grp["total"] >= 20]
+            grp["taxa"] = (grp["bons"] / grp["total"] * 100).round(1)
+            quality = grp.sort_values("taxa", ascending=False).head(15)["taxa"]
+            if quality.empty:
+                st.info("Nenhuma fonte com ≥20 artigos ainda.")
+            else:
+                st.bar_chart(quality, height=400)
+
+    _section("Top fontes", _render_top_sources)
+    st.divider()
+
+    # =========================================================
+    # DISTRIBUIÇÃO POR TIER
+    # =========================================================
+    def _render_tier():
+        st.subheader("🎯 Distribuição por tier")
+        tier_counts = df["tier"].value_counts()
+        order = ["high", "medium", "low_review", "discard"]
+        tier_counts = tier_counts.reindex([t for t in order if t in tier_counts.index])
+
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            for tier in tier_counts.index:
+                count = int(tier_counts[tier])
+                pct = count / len(df) * 100
+                emoji = {"high": "🟢", "medium": "🟡", "low_review": "🟠", "discard": "⚫"}.get(tier, "⚪")
+                st.metric(f"{emoji} {tier}", f"{count:,}", delta=f"{pct:.1f}%")
+        with c2:
+            st.bar_chart(tier_counts.rename("artigos"), height=300)
+
+    _section("Tiers", _render_tier)
+    st.divider()
+
+    # =========================================================
+    # TICKERS DETECTADOS
+    # =========================================================
+    def _render_tickers():
+        st.subheader("🏷️ Tickers detectados")
+
+        # Explode a lista de predicted_tickers
+        rows = []
+        for _, row in df.iterrows():
+            tickers = row.get("predicted_tickers")
+            if isinstance(tickers, list):
+                for t in tickers:
+                    rows.append({"date": row["date"], "ticker": t, "tier": row["tier"]})
+
+        if not rows:
+            st.info("Nenhum ticker classificado no período.")
+            return
+
+        tdf = pd.DataFrame(rows)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Frequência total**")
+            tcounts = tdf["ticker"].value_counts().rename("menções")
+            st.bar_chart(tcounts, height=320)
+        with col_b:
+            st.markdown("**Evolução por dia**")
+            t_daily = tdf.groupby(["date", "ticker"]).size().unstack(fill_value=0).sort_index()
+            st.line_chart(t_daily, height=320)
+
+    _section("Tickers", _render_tickers)

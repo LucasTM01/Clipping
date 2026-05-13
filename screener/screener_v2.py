@@ -76,6 +76,9 @@ def screen_articles_v2(articles: list[Article]) -> list[ScoredArticle]:
     audit_path = AUDIT_DIR / f"screening_audit_{datetime.now().strftime('%Y%m%d')}.jsonl"
     AUDIT_DIR.mkdir(exist_ok=True)
 
+    from data.news_db import init_db, upsert_article
+    init_db()
+
     passed: list[ScoredArticle] = []
     with open(audit_path, "a", encoding="utf-8") as audit_file:
         for article, emb in zip(unique, embeddings):
@@ -96,6 +99,7 @@ def screen_articles_v2(articles: list[Article]) -> list[ScoredArticle]:
                 "sent_to_analysis": sent,
             }
             audit_file.write(json.dumps(audit_entry, ensure_ascii=False) + "\n")
+            upsert_article(scored)
 
             if scored.tier != "discard":
                 passed.append(scored)

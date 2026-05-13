@@ -1,0 +1,27 @@
+{
+  "archive_story_list": {
+    "items": [
+      {
+        "headline": "JetBlue Rises on Strong Travel Demand Forecast, Spending Cuts",
+        "url": "/news/articles/2026-05-08/jetblue-first-quarter-loss-widens-company-to-deepen-cost-cuts?srnd=phx-industries-transportation",
+        "publishedAt": "2026-05-08T11:10:53.050Z",
+        "premium": false,
+        "summary": "JetBlue Airways raised its outlook for the second quarter, citing strong travel demand."
+      },
+      {
+        "headline": "Avis Budget's Worse-Than-Expected Loss Extends Stock Selloff",
+        "url": "/news/articles/2026-05-08/avis-worse-than-expected-loss-sparks-another-stock-selloff?srnd=phx-industries-transportation",
+        "publishedAt": "2026-05-08T09:30:00.000Z",
+        "premium": true,
+        "summary": "Avis Budget Group reported a wider-than-expected first-quarter loss."
+      },
+      {
+        "headline": "Mercedes to Challenge UK's £7.5 Billion Motor Finance Plan",
+        "url": "/news/articles/2026-05-07/mercedes-set-to-challenge-uk-s-7-5-billion-motor-finance-plan?srnd=phx-industries-transportation",
+        "publishedAt": "2026-05-07T14:00:00.000Z",
+        "premium": false,
+        "summary": "Mercedes-Benz is preparing to mount a legal challenge to a proposed compensation plan."
+      }
+    ]
+  }
+}

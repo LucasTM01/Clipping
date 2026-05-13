@@ -3,6 +3,9 @@ feedparser>=6.0
 trafilatura>=1.6
 requests>=2.31
 
+# Web scraping (sites sem RSS) — após instalar, rodar `playwright install chromium`
+playwright>=1.48
+
 # LLM - OpenAI GPT (análise principal)
 openai>=1.30
 

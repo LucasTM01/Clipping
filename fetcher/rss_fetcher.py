@@ -94,6 +94,7 @@ def fetch_all_feeds() -> list[Article]:
             logger.warning(f"Feed {feed_name} retornou erro: {feed.bozo_exception}")
             continue
 
+        lookback = feed_config.get("lookback_hours", MAX_ARTICLE_AGE_HOURS)
         count = 0
         for entry in feed.entries:
             title = entry.get("title", "").strip()
@@ -103,7 +104,7 @@ def fetch_all_feeds() -> list[Article]:
                 continue
 
             published = _parse_published_date(entry)
-            if not _is_recent(published, MAX_ARTICLE_AGE_HOURS):
+            if not _is_recent(published, lookback):
                 continue
 
             published_str = (
