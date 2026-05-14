@@ -107,3 +107,20 @@ def test_since_filter_drops_old(listing_html: str) -> None:
     # 2026-05-07T03:00 UTC is 42h before _NOW
     assert len(old) == 1
     assert "Marcopolo" in old[0].title
+
+
+def test_parse_listing_relative_urls() -> None:
+    """Relative hrefs (/noticias/YYYY/MM/DD/slug/id/) must be resolved to absolute."""
+    html = (
+        '<li><a href="/noticias/2026/05/08/embraer-kc-390/103305/">'
+        "Embraer KC-390</a></li>"
+        '<li><a href="/noticias/2026/05/08/stellantis-leapmotor/103306/">'
+        "Stellantis Leapmotor</a></li>"
+        '<a href="https://www.autodata.com.br/ultimas-noticias/?p=2">2</a>'
+    )
+    items, has_more = parse_listing(html)
+    assert len(items) == 2
+    for item in items:
+        assert item.url.startswith("https://www.autodata.com.br/noticias/")
+        assert item.url.endswith("/")
+    assert has_more is True

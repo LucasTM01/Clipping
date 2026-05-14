@@ -40,9 +40,10 @@ _HEADERS = {
 }
 
 # Matches article hrefs that embed the date, e.g.:
-#   https://www.autodata.com.br/noticias/2026/05/08/slug/103096/
+#   https://www.autodata.com.br/noticias/2026/05/08/slug/103096/  (absolute)
+#   /noticias/2026/05/08/slug/103096/                              (relative)
 _ARTICLE_LINK_RE = re.compile(
-    r'href="(https?://www\.autodata\.com\.br/noticias/(\d{4})/(\d{2})/(\d{2})/[^"]+)"'
+    r'href="((?:https?://www\.autodata\.com\.br)?/noticias/(\d{4})/(\d{2})/(\d{2})/[^"]+)"'
     r"[^>]*>(.*?)</a>",
     flags=re.IGNORECASE | re.DOTALL,
 )
@@ -80,7 +81,10 @@ def parse_listing(html: str) -> tuple[list[_ListingItem], bool]:
     url_to_item: dict[str, _ListingItem] = {}
 
     for m in _ARTICLE_LINK_RE.finditer(html):
-        url = m.group(1).rstrip("/") + "/"
+        raw_url = m.group(1)
+        if raw_url.startswith("/"):
+            raw_url = _BASE + raw_url
+        url = raw_url.rstrip("/") + "/"
         year, month, day = m.group(2), m.group(3), m.group(4)
         raw_title = m.group(5)
         title = unescape(_TAG_STRIP_RE.sub("", raw_title)).strip()

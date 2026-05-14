@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-m3"
     embedding_batch_size: int = 32
     embedding_top_k: int = 5
+    embedding_top_k_neg: int = 3  # negativos para margin scoring (Fase 2)
 
     # Document
     document_title: str = "Briefing de Mercado — Equity Research"

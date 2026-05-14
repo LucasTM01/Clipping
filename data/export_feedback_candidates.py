@@ -33,6 +33,10 @@ _NEAR_MISS_MIN_OFFSET = -0.05   # threshold - 0.05
 _NEAR_MISS_MAX_OFFSET = +0.35   # threshold + 0.35
 _ABSOLUTE_MIN = 0.25
 
+# Limite de near-miss candidatos adicionados por execução.
+# Se mais artigos se qualificarem, mantém apenas os N com maior score.
+_MAX_NEAR_MISS_PER_RUN = 100
+
 
 def _load_threshold() -> float:
     if CALIBRATION_PATH.exists():
@@ -56,10 +60,17 @@ def _load_existing_urls() -> set[str]:
     return urls
 
 
-def export_candidates(audit_paths: list[Path] | None = None) -> int:
+def export_candidates(
+    audit_paths: list[Path] | None = None,
+    max_per_run: int = _MAX_NEAR_MISS_PER_RUN,
+) -> int:
     """
     Processa os audit logs indicados e acumula near-misses em
     feedback/candidates.jsonl. Retorna o número de novos candidatos adicionados.
+
+    Se mais artigos se qualificarem do que `max_per_run`, mantém apenas os
+    `max_per_run` com maior relevance_score (os mais próximos do threshold são
+    os candidatos mais informativos para o retreino do screener).
     """
     threshold = _load_threshold()
     score_min = max(_ABSOLUTE_MIN, threshold + _NEAR_MISS_MIN_OFFSET)
@@ -130,6 +141,16 @@ def export_candidates(audit_paths: list[Path] | None = None) -> int:
     if not new_candidates:
         log.info("Nenhum novo near-miss candidato encontrado.")
         return 0
+
+    # Aplica o limite por execução: mantém os de maior score
+    if len(new_candidates) > max_per_run:
+        new_candidates.sort(key=lambda c: c["relevance_score"], reverse=True)
+        dropped = len(new_candidates) - max_per_run
+        new_candidates = new_candidates[:max_per_run]
+        log.info(
+            f"Limite de {max_per_run} candidatos atingido — "
+            f"{dropped} artigos com menor score descartados da fila de revisão."
+        )
 
     _append_candidates(new_candidates)
     log.info(f"Adicionados {len(new_candidates)} near-miss candidatos -> {CANDIDATES_PATH}")
@@ -227,6 +248,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Exporta near-miss candidates para revisão")
     parser.add_argument("--today", action="store_true", help="Só o audit de hoje")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=_MAX_NEAR_MISS_PER_RUN,
+        metavar="N",
+        help=f"Máximo de near-miss candidatos por execução (default: {_MAX_NEAR_MISS_PER_RUN})",
+    )
     args = parser.parse_args()
 
     if args.today:
@@ -236,7 +264,7 @@ if __name__ == "__main__":
     else:
         paths = None
 
-    n_near_miss = export_candidates(paths)
+    n_near_miss = export_candidates(paths, max_per_run=args.limit)
     n_approved = export_approved(paths)
     print(f"\nNovos near-miss exportados: {n_near_miss}")
     print(f"Novos aprovados exportados:  {n_approved}")

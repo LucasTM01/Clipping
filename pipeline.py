@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from config.settings import MAX_ARTICLE_AGE_HOURS
-from fetcher.rss_fetcher import fetch_all_feeds, enrich_full_text
+from fetcher.rss_fetcher import fetch_all_feeds, enrich_full_text, enrich_with_playwright
 from scrapers.registry import fetch_all_scrapers
 from screener.local_llm import screen_articles
 from screener.screener_v2 import screen_articles_v2
@@ -104,6 +104,7 @@ def run_pipeline(
         if enrich_text:
             logger.info("--- CAMADA 1b: Enriquecimento de texto ---")
             articles = enrich_full_text(articles)
+            articles = enrich_with_playwright(articles)  # Reuters/Bloomberg via Chrome real
 
         # --- Camada 2: Triagem ---
         if use_legacy_screener:

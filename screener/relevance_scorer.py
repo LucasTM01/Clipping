@@ -86,10 +86,14 @@ class RelevanceScorer:
     def build_candidate(self, article: Article, embedding: np.ndarray) -> Candidate:
         k = self._calibration.get("k", settings.embedding_top_k) if self._calibration else settings.embedding_top_k
         nearest_positives = self._store.search_knn(embedding, k=k, label_filter="positive")
+        nearest_negatives = self._store.search_knn(
+            embedding, k=settings.embedding_top_k_neg, label_filter="negative"
+        )
         return Candidate(
             article=article,
             embedding=embedding,
             nearest_positives=nearest_positives,
+            nearest_negatives=nearest_negatives,
         )
 
 

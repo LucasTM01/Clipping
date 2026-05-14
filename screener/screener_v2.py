@@ -77,7 +77,10 @@ def screen_articles_v2(articles: list[Article]) -> list[ScoredArticle]:
     AUDIT_DIR.mkdir(exist_ok=True)
 
     from data.news_db import init_db, upsert_article
+    from screener.classifier_loader import load_classifier
     init_db()
+
+    clf = load_classifier()
 
     passed: list[ScoredArticle] = []
     with open(audit_path, "a", encoding="utf-8") as audit_file:
@@ -98,6 +101,11 @@ def screen_articles_v2(articles: list[Article]) -> list[ScoredArticle]:
                 "rationale": scored.rationale,
                 "sent_to_analysis": sent,
             }
+
+            if clf is not None:
+                score_clf = float(clf.predict_proba(emb.reshape(1, -1))[0, 1])
+                audit_entry["score_clf"] = round(score_clf, 4)
+
             audit_file.write(json.dumps(audit_entry, ensure_ascii=False) + "\n")
             upsert_article(scored)
 

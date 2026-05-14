@@ -132,13 +132,38 @@ def fetch_all_feeds() -> list[Article]:
     return articles
 
 
+# Domínios que bloqueiam trafilatura (paywall / Cloudflare / 401).
+# Artigos dessas fontes são pulados pelo enriquecimento via requests/trafilatura,
+# mas podem ser enriquecidos via enrich_with_playwright() usando o Chrome real.
+_NO_ENRICH_DOMAINS: frozenset[str] = frozenset({
+    "www.reuters.com",
+    "reuters.com",
+    "www.bloomberg.com",
+    "bloomberg.com",
+})
+
+
+def _skip_enrich(url: str) -> bool:
+    """Retorna True se a URL pertence a um domínio que bloqueia enriquecimento."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+        return host in _NO_ENRICH_DOMAINS
+    except Exception:
+        return False
+
+
 def enrich_full_text(articles: list[Article]) -> list[Article]:
     """
     Para artigos que só têm summary/description curto, busca o texto
     completo via trafilatura em paralelo (ENRICH_MAX_WORKERS threads).
-    Só faz fetch se o texto atual for < 300 chars.
+    Só faz fetch se o texto atual for < 300 chars e o domínio não estiver
+    na lista de bloqueio (_NO_ENRICH_DOMAINS).
     """
-    to_enrich = [a for a in articles if len(a.full_text) < 300]
+    to_enrich = [
+        a for a in articles
+        if len(a.full_text) < 300 and not _skip_enrich(a.url)
+    ]
 
     if not to_enrich:
         logger.info("Nenhum artigo precisou de enriquecimento.")
@@ -169,4 +194,59 @@ def enrich_full_text(articles: list[Article]) -> list[Article]:
                 logger.warning(f"Falha ao enriquecer {article.url[:60]}: {e}")
 
     logger.info(f"Artigos enriquecidos com texto completo: {enriched}/{len(to_enrich)}")
+    return articles
+
+
+def enrich_with_playwright(articles: list[Article]) -> list[Article]:
+    """
+    Enriquece artigos de domínios bloqueados (Reuters, Bloomberg) via Playwright
+    usando o perfil real do Chrome — que traz cookies de sessão do usuário,
+    tornando o acesso indistinguível de uma visita humana.
+
+    Roda sequencialmente (uma página por vez dentro do mesmo contexto de browser)
+    para não disparar detecção de bot por múltiplos requests paralelos.
+    """
+    from scrapers.playwright_utils import persistent_browser_context
+
+    to_enrich = [
+        a for a in articles
+        if _skip_enrich(a.url) and len(a.full_text) < 300
+    ]
+    if not to_enrich:
+        return articles
+
+    logger.info(
+        f"Playwright enrich: {len(to_enrich)} artigos de domínios bloqueados "
+        f"(Reuters/Bloomberg)..."
+    )
+
+    enriched = 0
+    try:
+        with persistent_browser_context(headless=True) as ctx:
+            page = ctx.new_page()
+            for article in to_enrich:
+                try:
+                    page.goto(article.url, wait_until="domcontentloaded", timeout=20_000)
+                    # Pequena pausa para simular leitura humana e deixar JS carregar
+                    page.wait_for_timeout(1_500)
+                    html = page.content()
+                    text = trafilatura.extract(
+                        html,
+                        include_comments=False,
+                        include_tables=False,
+                        no_fallback=False,
+                    ) or ""
+                    if len(text) > len(article.full_text):
+                        article.full_text = text
+                        enriched += 1
+                        logger.debug(f"Playwright enrich OK: {article.url[:70]}")
+                    else:
+                        logger.debug(f"Playwright enrich: sem texto extraível em {article.url[:70]}")
+                except Exception as e:
+                    logger.debug(f"Playwright enrich falhou: {article.url[:70]}: {e}")
+            page.close()
+    except Exception as e:
+        logger.warning(f"Playwright enrich: browser não iniciou: {e}")
+
+    logger.info(f"Playwright enrich: {enriched}/{len(to_enrich)} artigos enriquecidos")
     return articles

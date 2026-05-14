@@ -45,3 +45,6 @@ data/*.docx
 
 # Stray pip artifact
 =1.9
+
+# Trained classifier models (large binary artifacts)
+models/*.joblib

@@ -39,7 +39,7 @@ python main.py --legacy-screener
 ## Tests
 
 ```powershell
-python -m pytest tests/ -v   # unit tests, no external deps (Qdrant mocked)
+python -m pytest tests/ scrapers/tests/ -v   # unit + scraper parser tests (no network)
 ```
 
 ## Dataset & Calibration (run when adding new data)
@@ -111,12 +111,17 @@ EMAIL_OPS_TO=["analyst@gmail.com"]
 
 Qdrant runs in Docker: `docker compose up -d`
 
-Playwright (para o módulo de scraping) precisa do Chromium baixado:
+Playwright precisa do Chromium e do Chrome instalados:
 
 ```powershell
 pip install -r requirements.txt
-playwright install chromium
+playwright install chromium   # para scrapers headless
+playwright install chrome     # para enrich_with_playwright (Reuters/Bloomberg)
 ```
+
+O `enrich_with_playwright` usa o perfil real do Chrome do usuário
+(`%LOCALAPPDATA%\Google\Chrome\User Data`) para carregar cookies de sessão.
+Se o Chrome estiver aberto durante o pipeline, faz fallback para sessão stealth limpa.
 
 ---
 
@@ -127,6 +132,9 @@ Data flows top-to-bottom through `pipeline.py → run_pipeline()`. No layer read
 ```
 Layer 1    fetcher/rss_fetcher.py      feedparser → list[Article]
 Layer 1b   fetcher/rss_fetcher.py      trafilatura full-text (ThreadPool, ENRICH_MAX_WORKERS)
+                                        skips _NO_ENRICH_DOMAINS (reuters.com, bloomberg.com)
+Layer 1b'  fetcher/rss_fetcher.py      enrich_with_playwright: Reuters/Bloomberg via Chrome
+                                        real profile (cookies) → sequential page loads
 Layer 1c   scrapers/registry.py        Playwright scrapers (sites sem RSS) -> list[Article]
 Layer 2    screener/screener_v2.py     BGE-M3 embeddings → Qdrant kNN → RelevanceScorer → list[ScoredArticle]
 Layer 3    analyzer/tiered_dispatcher  ScoredArticle → ScreeningResult → Qwen3.5/OpenAI → list[AnalysisResult]
@@ -169,18 +177,24 @@ All three tiers except `discard` go to LLM analysis.
 | `p95_score` | No (metadata) | Top-end scores for articles very similar to training set |
 | `failed_points` | No (metadata) | LOO errors (0 = clean run) |
 
-### Near-miss review range
+### Near-miss review range and daily limit
 
 `data/export_feedback_candidates.py` controls which discarded articles appear in the Streamlit
 review UI via two offsets relative to the threshold:
 
 ```python
-_NEAR_MISS_MIN_OFFSET = -0.05   # threshold - 0.05  (current: 0.518 - 0.05 = 0.468)
-_NEAR_MISS_MAX_OFFSET = +0.35   # threshold + 0.35  (current: 0.518 + 0.35 = 0.868)
+_NEAR_MISS_MIN_OFFSET = -0.05   # threshold - 0.05
+_NEAR_MISS_MAX_OFFSET = +0.35   # threshold + 0.35
+_MAX_NEAR_MISS_PER_RUN = 100    # cap per pipeline run — keeps top scores, drops the rest
 ```
 
+If more articles qualify than the cap, they are sorted by `relevance_score` descending and
+only the top 100 (highest-scoring, most borderline) are written to the review file.
+
+Override from the CLI: `python -m data.export_feedback_candidates --limit 50`
+
 Articles that were **approved** (score ≥ threshold, tier ≠ discard) are exported separately
-by `export_approved()` with `candidate_type="approved"`.
+by `export_approved()` with `candidate_type="approved"` — no cap applied there.
 
 ### Email notifications (notifier/)
 
@@ -249,7 +263,7 @@ Three tabs:
 | `generator/doc_generator.py` | Word document, sector-grouped |
 | `scrapers/registry.py` | Playwright scraper registry — orchestrates non-RSS sources |
 | `scrapers/aeroin.py` | AeroinScraper (https://aeroin.net/) |
-| `scrapers/playwright_utils.py` | Browser context manager + datetime cascade extractor |
+| `scrapers/playwright_utils.py` | Browser context manager + datetime cascade extractor + `persistent_browser_context()` (Chrome real profile) |
 | `scrapers/SITES.md` | Per-site documentation (selectors, paginação, gotchas) |
 | `data/ingest_history.py` | ETL: JSONL + feedback/labeled/ → Qdrant |
 | `data/calibrate_threshold.py` | LOO-CV threshold calibration |
@@ -273,6 +287,8 @@ Three tabs:
 | Change sector grouping in doc | `generator/doc_generator.py` → `SECTOR_GROUPS` |
 | Change tier boundaries | `screener/relevance_scorer.py` → `TIER_HIGH`, `TIER_MEDIUM` |
 | Change near-miss review range | `data/export_feedback_candidates.py` → `_NEAR_MISS_MIN_OFFSET`, `_NEAR_MISS_MAX_OFFSET` |
+| Change daily near-miss cap | `data/export_feedback_candidates.py` → `_MAX_NEAR_MISS_PER_RUN` |
+| Add blocked enrich domain | `fetcher/rss_fetcher.py` → `_NO_ENRICH_DOMAINS` (trafilatura skip) — `enrich_with_playwright` picks them up automatically |
 | Tune screening threshold manually | `config/calibration.json` → `threshold` |
 | Switch to OpenAI analysis | `.env` → `ANALYSIS_BACKEND=openai` |
 | Enable/disable email | `.env` → `EMAIL_ENABLED=true/false` |

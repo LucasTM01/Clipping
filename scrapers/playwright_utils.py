@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from contextlib import contextmanager
 from datetime import datetime, time, timezone, timedelta
@@ -61,6 +62,93 @@ def browser_context(
         )
         if stealth:
             ctx.add_init_script(_STEALTH_INIT_SCRIPT)
+        try:
+            yield ctx
+        finally:
+            ctx.close()
+            browser.close()
+
+
+def _find_chrome_user_data() -> str | None:
+    """Localiza o diretório User Data do Chrome no Windows."""
+    candidates = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data"),
+        os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Google", "Chrome", "User Data"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+@contextmanager
+def persistent_browser_context(
+    headless: bool = True,
+    user_data_dir: str | None = None,
+) -> Iterator:
+    """Contexto Playwright usando o perfil real do Chrome do usuário.
+
+    Isso carrega todos os cookies e sessões do Chrome, tornando o browser
+    indistinguível de uma visita humana (incluindo cookies de login em sites
+    como Reuters). Se o Chrome já estiver aberto (perfil bloqueado) ou não
+    for encontrado, faz fallback para uma sessão stealth limpa.
+
+    Args:
+        headless: Roda sem janela visível (default True).
+        user_data_dir: Caminho explícito do User Data do Chrome. Se None,
+            detecta automaticamente no Windows.
+    """
+    from playwright.sync_api import sync_playwright
+
+    _STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
+    _UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    if user_data_dir is None:
+        user_data_dir = _find_chrome_user_data()
+
+    with sync_playwright() as p:
+        # --- Tentativa 1: perfil real do Chrome (traz todos os cookies) ---
+        if user_data_dir:
+            try:
+                ctx = p.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=headless,
+                    channel="chrome",
+                    args=_STEALTH_ARGS,
+                    user_agent=_UA,
+                    locale="pt-BR",
+                    viewport={"width": 1920, "height": 1080},
+                )
+                ctx.add_init_script(_STEALTH_INIT_SCRIPT)
+                logger.debug("Playwright: usando perfil real do Chrome (%s)", user_data_dir)
+                try:
+                    yield ctx
+                finally:
+                    ctx.close()
+                return
+            except Exception as e:
+                logger.warning(
+                    "Playwright: perfil Chrome indisponível (%s) — "
+                    "Chrome pode estar aberto. Usando sessão stealth limpa.", e
+                )
+
+        # --- Fallback: Chrome limpo com stealth (sem cookies de sessão) ---
+        browser = p.chromium.launch(
+            headless=headless,
+            channel="chrome",
+            args=_STEALTH_ARGS,
+        )
+        ctx = browser.new_context(
+            user_agent=_UA,
+            locale="pt-BR",
+            viewport={"width": 1920, "height": 1080},
+        )
+        ctx.add_init_script(_STEALTH_INIT_SCRIPT)
+        logger.debug("Playwright: usando sessão stealth limpa (sem perfil)")
         try:
             yield ctx
         finally:

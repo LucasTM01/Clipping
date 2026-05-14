@@ -19,7 +19,7 @@ import requests
 import trafilatura
 
 from fetcher.rss_fetcher import Article
-from scrapers.playwright_utils import extract_published_at
+from scrapers.playwright_utils import BR_TZ, extract_published_at
 
 logger = logging.getLogger(__name__)
 
@@ -142,8 +142,18 @@ class AutomotiveBusinessScraper:
                     pub = datetime.fromisoformat(article.published_at)
                 except ValueError:
                     pub = None
-                if pub is not None and pub < since:
-                    continue
+                if pub is not None:
+                    # Se o timestamp é meia-noite no horário de Brasília, a fonte
+                    # forneceu apenas a data (sem hora). O artigo pode ter sido
+                    # publicado em qualquer momento do dia — tratar como 23:59:59
+                    # para não rejeitar incorretamente artigos de ontem.
+                    pub_br = pub.astimezone(BR_TZ)
+                    if pub_br.hour == 0 and pub_br.minute == 0 and pub_br.second == 0:
+                        pub = pub_br.replace(
+                            hour=23, minute=59, second=59
+                        ).astimezone(timezone.utc)
+                    if pub < since:
+                        continue
                 results.append(article)
         return results
 

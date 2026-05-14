@@ -179,6 +179,33 @@ def test_fetch_articles_http_error_returns_partial(listing_html: str, article_ht
     assert len(articles) >= 1
 
 
+def test_fetch_articles_date_only_not_filtered(listing_html: str, article_html: str) -> None:
+    """Articles with date-only (midnight) timestamps must NOT be filtered by the 24h window.
+
+    The site sometimes provides only a date (no time). extract_published_at returns
+    midnight BR_TZ → 03:00 UTC. With since = now - 24h, a yesterday midnight article
+    would incorrectly fall before `since`. The fix treats midnight as 23:59:59.
+    """
+    # Strip time from JSON-LD and meta so extract_published_at produces midnight BR_TZ
+    date_only_html = article_html.replace(
+        '"datePublished": "2026-05-09T10:32:00"',
+        '"datePublished": "2026-05-09"',
+    ).replace(
+        'content="2026-05-09T13:32:00+00:00"',
+        'content="2026-05-09"',
+    )
+    scraper = AutomotiveBusinessScraper(max_pages=1, concurrency=1)
+    with patch("scrapers.automotivebusiness.requests.get") as mock_get:
+        mock_get.side_effect = (
+            [_mock_response(listing_html)]
+            + [_mock_response(date_only_html)] * 5
+        )
+        articles = scraper.fetch_articles(_SINCE_24H)
+
+    # All 5 articles must pass — none should be dropped due to midnight timestamp
+    assert len(articles) == 5
+
+
 def test_scraper_satisfies_base_protocol() -> None:
     from scrapers.base import BaseScraper
     assert isinstance(AutomotiveBusinessScraper(), BaseScraper)

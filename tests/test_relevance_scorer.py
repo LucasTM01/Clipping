@@ -200,9 +200,13 @@ class TestRelevanceScorerScore:
         assert result.tier == "discard"
 
     def test_build_candidate_uses_calibration_k(self):
+        from unittest.mock import call
         scorer, mock_store = self._make_scorer()
         mock_store.search_knn.return_value = _neighbors(0.8)
         emb = np.ones(1024)
         candidate = scorer.build_candidate(_article(), emb)
-        mock_store.search_knn.assert_called_once_with(emb, k=5, label_filter="positive")
+        # build_candidate makes two calls: positives (k=5) + negatives (k=3)
+        assert mock_store.search_knn.call_count == 2
+        mock_store.search_knn.assert_any_call(emb, k=5, label_filter="positive")
+        mock_store.search_knn.assert_any_call(emb, k=3, label_filter="negative")
         assert len(candidate.nearest_positives) == 1

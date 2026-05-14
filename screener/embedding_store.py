@@ -102,6 +102,44 @@ class EmbeddingStore:
         )
         return [(r.payload, r.score) for r in results.points]
 
+    def scroll_all(
+        self,
+        label: Literal["positive", "negative"] | None = None,
+        batch_size: int = 256,
+    ) -> list[tuple[np.ndarray, str]]:
+        """
+        Retorna todos os pontos do Qdrant como lista de (embedding, label).
+        Usa paginação interna para colecções grandes.
+        """
+        scroll_filter = None
+        if label:
+            scroll_filter = Filter(
+                must=[FieldCondition(key="label", match=MatchValue(value=label))]
+            )
+
+        results: list[tuple[np.ndarray, str]] = []
+        offset = None
+
+        while True:
+            points, next_offset = self._client.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=scroll_filter,
+                limit=batch_size,
+                offset=offset,
+                with_vectors=True,
+                with_payload=True,
+            )
+            for p in points:
+                vec = np.array(p.vector, dtype=np.float32)
+                lbl = p.payload.get("label", "positive")
+                results.append((vec, lbl))
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return results
+
     def count(self) -> int:
         return self._client.count(collection_name=settings.qdrant_collection).count
 
