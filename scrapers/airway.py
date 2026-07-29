@@ -9,6 +9,7 @@ from each article page (JSON-LD datePublished / meta / <time>).
 from __future__ import annotations
 
 import logging
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -41,6 +42,10 @@ _NEXT_PAGE_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _TAG_STRIP_RE = re.compile(r"<[^>]+>")
+_JSONLD_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass
@@ -53,6 +58,41 @@ def parse_listing(html: str) -> tuple[list[_ListingItem], Optional[str]]:
     """Return (items, next_page_url) from a listing page HTML."""
     items: list[_ListingItem] = []
     seen: set[str] = set()
+
+    # Since July/2026 Airway publishes the article list in the CollectionPage
+    # JSON-LD, rather than in the former WordPress ``entry-title`` cards.
+    # Prefer that structured data when present and retain the HTML parser below
+    # as a fallback for older pages and temporary template rollbacks.
+    for raw_json in _JSONLD_RE.findall(html):
+        try:
+            data = json.loads(raw_json.strip())
+        except json.JSONDecodeError:
+            continue
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            entity = node.get("mainEntity")
+            if not isinstance(entity, dict):
+                continue
+            entries = entity.get("itemListElement")
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                raw_url = entry.get("item")
+                if isinstance(raw_url, dict):
+                    raw_url = raw_url.get("@id") or raw_url.get("url")
+                title = str(entry.get("name") or "").strip()
+                if not isinstance(raw_url, str) or not raw_url or not title:
+                    continue
+                if raw_url.startswith("/"):
+                    raw_url = "https://www.airway.com.br" + raw_url
+                if raw_url in seen:
+                    continue
+                seen.add(raw_url)
+                items.append(_ListingItem(url=raw_url, title=title))
 
     for url, raw_title in _ARTICLE_LINK_RE.findall(html):
         if url in seen:
@@ -70,6 +110,8 @@ def parse_listing(html: str) -> tuple[list[_ListingItem], Optional[str]]:
 
 class AirwayScraper:
     name: str = "Airway"
+    # The canonical tag currently advertises /latest-news/, but that endpoint
+    # returns HTTP 404. The legacy route remains the live listing endpoint.
     base_url: str = "https://www.airway.com.br/ultimas-noticias/"
     language: str = "pt-br"
 

@@ -51,6 +51,25 @@ def test_parse_listing_no_next_on_last_page() -> None:
     assert next_url is None
 
 
+def test_parse_listing_extracts_current_jsonld_item_list() -> None:
+    html = '''
+    <script type="application/ld+json">{
+      "@type": "CollectionPage",
+      "mainEntity": {"@type": "ItemList", "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "Notícia atual", "item": "/noticia-atual/"},
+        {"@type": "ListItem", "position": 2, "name": "Outra notícia", "item": "https://www.airway.com.br/outra-noticia/"}
+      ]}
+    }</script>
+    '''
+
+    items, _ = parse_listing(html)
+
+    assert [(item.title, item.url) for item in items] == [
+        ("Notícia atual", "https://www.airway.com.br/noticia-atual/"),
+        ("Outra notícia", "https://www.airway.com.br/outra-noticia/"),
+    ]
+
+
 def test_extract_published_at_from_article(article_html: str) -> None:
     dt = extract_published_at(article_html)
     assert dt is not None

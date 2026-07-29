@@ -10,6 +10,7 @@ import pytest
 
 from scrapers.automotivebusiness import (
     AutomotiveBusinessScraper,
+    parse_api_listing,
     parse_listing,
     parse_article,
 )
@@ -79,6 +80,19 @@ def test_parse_listing_dedup() -> None:
 
 def test_parse_listing_empty() -> None:
     assert parse_listing("<html></html>") == []
+
+
+def test_parse_api_listing_extracts_panel_posts() -> None:
+    posts = [{
+        "link": "https://painel.automotivebusiness.com.br/mercado/noticia-atual/",
+        "title": {"rendered": "Notícia &amp; atual"},
+    }]
+
+    items = parse_api_listing(posts)
+
+    assert [(item.title, item.url) for item in items] == [
+        ("Notícia & atual", "https://painel.automotivebusiness.com.br/mercado/noticia-atual/"),
+    ]
 
 
 # ---------------------------------------------------------------------------

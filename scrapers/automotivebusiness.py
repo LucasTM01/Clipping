@@ -24,6 +24,8 @@ from scrapers.playwright_utils import BR_TZ, extract_published_at
 logger = logging.getLogger(__name__)
 
 _BASE = "https://www.automotivebusiness.com.br"
+_PANEL_BASE = "https://painel.automotivebusiness.com.br"
+_POSTS_API_URL = f"{_PANEL_BASE}/wp-json/wp/v2/posts"
 
 _HEADERS = {
     "User-Agent": (
@@ -45,6 +47,7 @@ _TAG_STRIP_RE = re.compile(r"<[^>]+>")
 class _ListingItem:
     url: str
     title: str
+    published_at: Optional[datetime] = None
 
 
 def parse_listing(html: str) -> list[_ListingItem]:
@@ -63,6 +66,45 @@ def parse_listing(html: str) -> list[_ListingItem]:
     return items
 
 
+def parse_api_listing(posts: object) -> list[_ListingItem]:
+    """Extract listing items from Automotive Business's public WordPress API.
+
+    The public site migrated its listing to a client-rendered application in
+    July/2026. Its canonical, server-side source of articles remains the
+    WordPress REST endpoint on ``painel.automotivebusiness.com.br``.
+    """
+    if not isinstance(posts, list):
+        return []
+
+    items: list[_ListingItem] = []
+    seen: set[str] = set()
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        url = post.get("link")
+        title_data = post.get("title")
+        raw_title = title_data.get("rendered", "") if isinstance(title_data, dict) else ""
+        if not isinstance(url, str) or not url or url in seen:
+            continue
+        title = unescape(_TAG_STRIP_RE.sub("", str(raw_title))).strip()
+        if not title:
+            continue
+        published_at = None
+        raw_date = post.get("date_gmt") or post.get("date")
+        if isinstance(raw_date, str):
+            try:
+                published_at = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                if published_at.tzinfo is None:
+                    published_at = published_at.replace(tzinfo=timezone.utc)
+                else:
+                    published_at = published_at.astimezone(timezone.utc)
+            except ValueError:
+                pass
+        seen.add(url)
+        items.append(_ListingItem(url=url, title=title, published_at=published_at))
+    return items
+
+
 def parse_article(html: str) -> tuple[Optional[datetime], str]:
     """Extract (published_at, full_text) from an article page HTML."""
     published_at = extract_published_at(html)
@@ -78,6 +120,7 @@ def parse_article(html: str) -> tuple[Optional[datetime], str]:
 class AutomotiveBusinessScraper:
     name: str = "Automotive Business"
     base_url: str = f"{_BASE}/noticias"
+    posts_api_url: str = _POSTS_API_URL
     language: str = "pt-br"
 
     def __init__(
@@ -90,37 +133,49 @@ class AutomotiveBusinessScraper:
         self.concurrency = concurrency if concurrency is not None else SCRAPER_CONCURRENCY
 
     def fetch_articles(self, since: datetime) -> list[Article]:
-        listing_items = self._collect_listing()
+        listing_items = self._collect_listing(since)
         if not listing_items:
             return []
         return self._fetch_articles(listing_items, since)
 
-    def _collect_listing(self) -> list[_ListingItem]:
+    def _collect_listing(self, since: datetime) -> list[_ListingItem]:
         """Paginate via ?page=N up to max_pages and collect all article URLs."""
         items: list[_ListingItem] = []
         seen: set[str] = set()
 
         for page_num in range(1, self.max_pages + 1):
-            url = (
-                self.base_url
-                if page_num == 1
-                else f"{self.base_url}?page={page_num}"
-            )
             try:
-                resp = requests.get(url, headers=_HEADERS, timeout=20)
+                resp = requests.get(
+                    self.posts_api_url,
+                    headers=_HEADERS,
+                    params={"page": page_num, "per_page": 100, "orderby": "date", "order": "desc"},
+                    timeout=20,
+                )
                 resp.raise_for_status()
             except Exception as e:
                 logger.warning(f"Automotive Business: erro na página {page_num}: {e}")
                 break
 
-            page_items = parse_listing(resp.text)
+            # The legacy HTML fallback keeps the scraper operational if the
+            # API is temporarily unavailable or a cached old response is used.
+            try:
+                page_items = parse_api_listing(resp.json())
+            except (TypeError, ValueError):
+                page_items = []
+            if not page_items:
+                page_items = parse_listing(resp.text)
             new = [i for i in page_items if i.url not in seen]
             if not new:
                 break
             for i in new:
                 seen.add(i.url)
-            items.extend(new)
+            # REST results are ordered newest-first. Avoid fetching hundreds of
+            # old article pages when the API already supplies publication dates.
+            recent = [i for i in new if i.published_at is None or i.published_at >= since]
+            items.extend(recent)
             logger.debug(f"Automotive Business: página {page_num} — {len(new)} artigos")
+            if any(i.published_at is not None and i.published_at < since for i in new):
+                break
 
         logger.info(f"Automotive Business: {len(items)} URLs coletadas")
         return items
