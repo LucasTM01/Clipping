@@ -33,13 +33,23 @@ class Article:
 
 
 def _parse_published_date(entry: dict) -> datetime | None:
-    """Tenta extrair a data de publicação de um entry do feedparser."""
+    """Tenta extrair a data de publicação de um entry do feedparser.
+
+    ``calendar.timegm`` e não ``time.mktime``: o feedparser já devolve
+    ``published_parsed`` normalizado em **UTC**, e ``mktime`` interpreta a struct
+    como horário **local**, somando o offset da máquina. Numa máquina em UTC−3
+    isso gravava toda publicação 3h adiantada — 18% dos artigos ficavam com
+    ``published_at`` posterior ao momento em que foram coletados, e o feed do
+    dashboard mostrava "publicado daqui a 2 horas". ``timegm`` é a inversa
+    correta de ``gmtime``, que é o que o feedparser usa.
+    """
+    from calendar import timegm
+
     for date_field in ("published_parsed", "updated_parsed"):
         parsed = entry.get(date_field)
         if parsed:
             try:
-                from time import mktime
-                return datetime.fromtimestamp(mktime(parsed), tz=timezone.utc)
+                return datetime.fromtimestamp(timegm(parsed), tz=timezone.utc)
             except (OverflowError, ValueError, OSError):
                 continue
     return None
@@ -70,6 +80,28 @@ def _extract_full_text(url: str) -> str:
     return ""
 
 
+_FEED_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
+
+
+def fetch_feed(url: str, timeout: int = 30) -> feedparser.FeedParserDict:
+    """Baixa e parseia um feed com timeout.
+
+    ``feedparser.parse(url)`` não tem timeout — um servidor que trava a conexão
+    trava o pipeline inteiro. Também remove espaço/BOM antes do ``<?xml``, que
+    alguns WordPress emitem e que faz o feedparser descartar o feed inteiro.
+    """
+    resp = requests.get(url, headers=_FEED_HEADERS, timeout=timeout)
+    resp.raise_for_status()
+    return feedparser.parse(resp.content.lstrip(b"\xef\xbb\xbf \t\r\n"))
+
+
 def fetch_all_feeds() -> list[Article]:
     """
     Coleta artigos de todos os feeds configurados.
@@ -85,9 +117,9 @@ def fetch_all_feeds() -> list[Article]:
         logger.info(f"Coletando feed: {feed_name} ({feed_url})")
 
         try:
-            feed = feedparser.parse(feed_url)
+            feed = fetch_feed(feed_url)
         except Exception as e:
-            logger.error(f"Erro ao parsear feed {feed_name}: {e}")
+            logger.error(f"Erro ao buscar feed {feed_name}: {e}")
             continue
 
         if feed.bozo and not feed.entries:
@@ -143,14 +175,31 @@ _NO_ENRICH_DOMAINS: frozenset[str] = frozenset({
 })
 
 
-def _skip_enrich(url: str) -> bool:
-    """Retorna True se a URL pertence a um domínio que bloqueia enriquecimento."""
+# Domínios que sempre recusam o fetch (403 / paywall) e não têm rota via
+# Playwright — nenhum enriquecimento é tentado; fica o summary do feed.
+#   ft.com           → 403 em 100% das tentativas (paywall)
+#   weg.net          → 403 para tudo que não é browser interativo
+#   news.google.com  → links do Google News que não puderam ser decodificados
+_NEVER_ENRICH_DOMAINS: frozenset[str] = frozenset({
+    "www.ft.com",
+    "ft.com",
+    "www.weg.net",
+    "weg.net",
+    "news.google.com",
+})
+
+
+def _host(url: str) -> str:
     try:
         from urllib.parse import urlparse
-        host = urlparse(url).netloc.lower()
-        return host in _NO_ENRICH_DOMAINS
+        return urlparse(url).netloc.lower()
     except Exception:
-        return False
+        return ""
+
+
+def _skip_enrich(url: str) -> bool:
+    """Retorna True se a URL pertence a um domínio que bloqueia enriquecimento."""
+    return _host(url) in _NO_ENRICH_DOMAINS
 
 
 def enrich_full_text(articles: list[Article]) -> list[Article]:
@@ -158,11 +207,13 @@ def enrich_full_text(articles: list[Article]) -> list[Article]:
     Para artigos que só têm summary/description curto, busca o texto
     completo via trafilatura em paralelo (ENRICH_MAX_WORKERS threads).
     Só faz fetch se o texto atual for < 300 chars e o domínio não estiver
-    na lista de bloqueio (_NO_ENRICH_DOMAINS).
+    na lista de bloqueio (_NO_ENRICH_DOMAINS / _NEVER_ENRICH_DOMAINS).
     """
     to_enrich = [
         a for a in articles
-        if len(a.full_text) < 300 and not _skip_enrich(a.url)
+        if len(a.full_text) < 300
+        and not _skip_enrich(a.url)
+        and _host(a.url) not in _NEVER_ENRICH_DOMAINS
     ]
 
     if not to_enrich:
@@ -197,6 +248,10 @@ def enrich_full_text(articles: list[Article]) -> list[Article]:
     return articles
 
 
+_BLOCKED_STATUSES = frozenset({401, 403, 429})
+_MAX_BLOCKED_IN_A_ROW = 3
+
+
 def enrich_with_playwright(articles: list[Article]) -> list[Article]:
     """
     Enriquece artigos de domínios bloqueados (Reuters, Bloomberg) via Playwright
@@ -205,6 +260,10 @@ def enrich_with_playwright(articles: list[Article]) -> list[Article]:
 
     Roda sequencialmente (uma página por vez dentro do mesmo contexto de browser)
     para não disparar detecção de bot por múltiplos requests paralelos.
+
+    Se um domínio responder 401/403/429 em _MAX_BLOCKED_IN_A_ROW páginas
+    seguidas, os demais artigos dele são pulados — sem sessão válida no perfil
+    do pipeline, insistir só gasta minutos do run sem trazer texto.
     """
     from scrapers.playwright_utils import persistent_browser_context
 
@@ -221,12 +280,26 @@ def enrich_with_playwright(articles: list[Article]) -> list[Article]:
     )
 
     enriched = 0
+    blocked_in_a_row: dict[str, int] = {}
     try:
         with persistent_browser_context(headless=True) as ctx:
             page = ctx.new_page()
             for article in to_enrich:
+                host = _host(article.url)
+                if blocked_in_a_row.get(host, 0) >= _MAX_BLOCKED_IN_A_ROW:
+                    continue
                 try:
-                    page.goto(article.url, wait_until="domcontentloaded", timeout=20_000)
+                    resp = page.goto(article.url, wait_until="domcontentloaded", timeout=20_000)
+                    if resp is not None and resp.status in _BLOCKED_STATUSES:
+                        blocked_in_a_row[host] = blocked_in_a_row.get(host, 0) + 1
+                        if blocked_in_a_row[host] == _MAX_BLOCKED_IN_A_ROW:
+                            logger.warning(
+                                f"Playwright enrich: {host} bloqueou {_MAX_BLOCKED_IN_A_ROW} "
+                                f"páginas seguidas (HTTP {resp.status}) — pulando o restante. "
+                                "Rode `python -m tools.setup_pipeline_browser` para renovar a sessão."
+                            )
+                        continue
+                    blocked_in_a_row[host] = 0
                     # Pequena pausa para simular leitura humana e deixar JS carregar
                     page.wait_for_timeout(1_500)
                     html = page.content()

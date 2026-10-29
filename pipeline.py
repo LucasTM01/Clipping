@@ -62,13 +62,21 @@ def run_pipeline(
     enrich_text: bool = True,
     verbose: bool = False,
     use_legacy_screener: bool = False,
+    deep_dive: bool | None = None,
+    clipping_version: str = "v2",
 ) -> Path | None:
     """
     Executa o pipeline completo e retorna o path do documento gerado.
+
+    deep_dive: força ligar/desligar o 3º email (análise detalhada em 2 estágios).
+               None → usa settings.deep_dive_enabled.
+    clipping_version: "v2" (default) → email "Safra's Morning Notes - AI View"
+               (inglês, factual, por setor). "v1" → briefing HTML legado (PT, com tese).
     """
     setup_logging(verbose)
     start_time = datetime.now()
     stats = PipelineStats(started_at=start_time)
+    scored: list = []
 
     logger.info("=" * 60)
     logger.info("PIPELINE DE CLIPPING — EQUITY RESEARCH")
@@ -136,6 +144,19 @@ def run_pipeline(
                 output_path = generate_briefing([])
                 _log_summary(start_time, len(articles), 0, 0, output_path)
                 return output_path
+
+            # --- Limite de artigos por briefing ---
+            from config.settings import settings as _s
+            max_arts = _s.briefing_max_articles
+            if max_arts > 0 and len(scored) > max_arts:
+                scored.sort(key=lambda s: s.relevance_score, reverse=True)
+                dropped = len(scored) - max_arts
+                scored = scored[:max_arts]
+                logger.info(
+                    f"Limite de {max_arts} artigos atingido — "
+                    f"{dropped} artigos com menor score removidos do briefing."
+                )
+
             logger.info("--- CAMADA 3: Análise e sumarização (tiered dispatcher) ---")
             analyses = dispatch_batch(scored)
 
@@ -183,11 +204,39 @@ def run_pipeline(
     stats.finished_at = datetime.now()
     from config.settings import settings as _settings
     if _settings.email_enabled:
-        logger.info("--- Enviando emails ---")
-        from notifier.email_sender import send_briefing_email, send_ops_report
-        if analyses:
+        logger.info(f"--- Enviando emails (briefing {clipping_version}) ---")
+        from notifier.email_sender import (
+            send_briefing_email,
+            send_briefing_v2_email,
+            send_ops_report,
+        )
+        if clipping_version == "v2":
+            if scored:
+                from analyzer.briefing_v2 import build_briefing_v2
+                items = build_briefing_v2(scored)
+                send_briefing_v2_email(items, stats, _settings.email_briefing_to)
+            elif analyses:
+                logger.warning(
+                    "Briefing v2 requer o screener v2 (sem ScoredArticle no modo legacy) "
+                    "— enviando briefing v1."
+                )
+                send_briefing_email(analyses, _settings.email_briefing_to)
+        elif analyses:
             send_briefing_email(analyses, _settings.email_briefing_to)
         send_ops_report(stats, _settings.email_ops_to)
+
+    # --- Deep dive: análise detalhada em 2 estágios (3º email) ---
+    run_deep_dive = _settings.deep_dive_enabled if deep_dive is None else deep_dive
+    if run_deep_dive and scored:
+        logger.info("--- Deep dive: análise detalhada (Estágio A local + Estágio B API) ---")
+        try:
+            from analyzer.deep_dive import run_deep_dive as _run_deep_dive
+            from notifier.email_sender import send_deep_dive_email
+            briefs, synthesis = _run_deep_dive(scored)
+            if briefs:
+                send_deep_dive_email(briefs, synthesis, _settings.deep_dive_to)
+        except Exception as e:
+            logger.warning(f"Deep dive falhou (não crítico): {e}", exc_info=True)
 
     return output_path
 

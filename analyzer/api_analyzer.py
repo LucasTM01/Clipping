@@ -49,12 +49,13 @@ class AnalysisResult:
 
 
 def _build_analysis_prompt(screening: ScreeningResult) -> str:
+    # Tickers do screener NÃO são passados ao prompt de propósito — o LLM
+    # classifica de forma independente lendo o texto (evita ancoragem em EMBR3).
+    # Eles permanecem em screening.tickers apenas como fallback se o LLM falhar.
     return ANALYSIS_USER_PROMPT.format(
         title=screening.article.title,
         source=screening.article.source,
         published_at=screening.article.published_at,
-        tickers=", ".join(screening.tickers) if screening.tickers else "Nenhum (macro/setorial)",
-        sector_tags=", ".join(screening.sector_tags) if screening.sector_tags else "N/A",
         full_text=screening.article.full_text[:4000],
     )
 

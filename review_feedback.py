@@ -114,6 +114,7 @@ def load_audit_logs() -> list[dict]:
     return records
 
 
+@st.cache_data(ttl=60)
 def get_qdrant_count() -> int | None:
     try:
         from qdrant_client import QdrantClient
@@ -142,6 +143,7 @@ with tab_db:
     with col_refresh:
         if st.button("🔄 Atualizar", width="stretch"):
             st.cache_data.clear()
+            st.session_state.pop("records", None)   # força reload dos candidatos
             st.rerun()
 
     dataset = load_dataset()
@@ -218,7 +220,8 @@ with tab_db:
         with st.expander("Arquivos em feedback/labeled/"):
             for path in sorted(LABELED_DIR.glob("*.jsonl")):
                 size_kb = path.stat().st_size // 1024
-                n_lines = sum(1 for _ in open(path, encoding="utf-8"))
+                with open(path, encoding="utf-8") as fh:
+                    n_lines = sum(1 for _ in fh)
                 st.markdown(f"- `{path.name}` — {n_lines} registros, {size_kb} KB")
 
     st.divider()
@@ -254,10 +257,6 @@ with tab_review:
     if "records" not in st.session_state:
         st.session_state.records = load_candidates()
 
-    if "index" not in st.session_state:
-        unreviewed = [i for i, r in enumerate(st.session_state.records) if not r.get("_reviewed")]
-        st.session_state.index = unreviewed[0] if unreviewed else 0
-
     records = st.session_state.records
     total = len(records)
     reviewed_count = sum(1 for r in records if r.get("_reviewed"))
@@ -276,128 +275,38 @@ with tab_review:
 
     st.divider()
 
-    _review_active = total > 0 and remaining > 0
-
     if total == 0:
         st.warning("Nenhum candidato encontrado em `feedback/candidates.jsonl`.")
         st.info("Execute o pipeline primeiro: `python main.py --no-enrich`")
-    elif remaining == 0:
-        st.success("Todos os artigos foram revisados!")
-        if st.button("Exportar para feedback/labeled/ e preparar ingest", type="primary"):
-            out = export_labeled(records)
-            st.success(f"Exportado: `{out}`")
-            st.code(
-                "python -m data.ingest_history\n"
-                "python -m data.calibrate_threshold",
-                language="bash",
+    else:
+        # ── Inline filters + export ─────────────────────────────────────────
+        fc1, fc2, fc3 = st.columns([2, 2, 1])
+        with fc1:
+            filter_type = st.selectbox(
+                "Tipo",
+                ["Todos", "🟢 Aprovados", "🟡 Near-miss"],
+                index=0,
+                key="rv_filter_type",
             )
+        with fc2:
+            filter_opt = st.selectbox(
+                "Status",
+                ["Todos", "Não revisados", "Relevantes", "Irrelevantes"],
+                index=1,
+                key="rv_filter_opt",
+            )
+        with fc3:
+            st.write("")  # spacer for vertical alignment
+            if st.button("💾 Salvar para labeled/", width="stretch", key="rv_export"):
+                out = export_labeled(records)
+                st.success(f"Salvo: `{out}`")
+                st.code(
+                    "python -m data.ingest_history\n"
+                    "python -m data.calibrate_threshold",
+                    language="bash",
+                )
 
-if _review_active:
-  with tab_review:
-    idx = st.session_state.index
-    if idx >= total:
-        idx = 0
-        st.session_state.index = 0
-
-    record = records[idx]
-
-    # Navigation
-    nav_col1, nav_col2, nav_col3 = st.columns([1, 3, 1])
-    with nav_col1:
-        if st.button("← Anterior", width="stretch"):
-            st.session_state.index = max(0, idx - 1)
-            st.rerun()
-    with nav_col2:
-        st.markdown(
-            f"<p style='text-align:center; color:gray; margin-top:8px;'>"
-            f"Artigo {idx + 1} de {total} — {remaining} restantes</p>",
-            unsafe_allow_html=True,
-        )
-    with nav_col3:
-        if st.button("Próximo →", width="stretch"):
-            st.session_state.index = min(total - 1, idx + 1)
-            st.rerun()
-
-    # Article card
-    status_icon = ""
-    if record.get("_reviewed"):
-        status_icon = "✅ " if record.get("relevant_yes_no") else "❌ "
-
-    st.subheader(f"{status_icon}{record.get('title', '(sem título)')}")
-
-    ctype = record.get("candidate_type", "near_miss")
-    type_badge = "🟢 Aprovado" if ctype == "approved" else "🟡 Near-miss"
-    tier_label = record.get("tier", "—")
-    st.caption(f"{type_badge}  ·  Score: `{record.get('relevance_score', 0):.4f}`  ·  Tier: `{tier_label}`")
-
-    meta_col1, meta_col2, meta_col3 = st.columns(3)
-    meta_col1.markdown(f"**Fonte:** {record.get('source', '—')}")
-    meta_col2.markdown(f"**Data:** {record.get('date', '—')}")
-    meta_col3.markdown(f"**Tickers:** {', '.join(record.get('predicted_tickers', [])) or '—'}")
-
-    url = record.get("url", "")
-    if url:
-        st.markdown(f"[Abrir artigo]({url})")
-
-    if record.get("body"):
-        with st.expander("Ver texto completo"):
-            st.write(record["body"][:2000])
-
-    st.divider()
-
-    # Action buttons
-    def _label(relevant: bool | None) -> None:
-        records[idx]["relevant_yes_no"] = relevant
-        records[idx]["_reviewed"] = True
-        save_candidates(records)
-        if relevant is not None:
-            article_url = records[idx].get("url", "")
-            if article_url:
-                try:
-                    from data.news_db import update_capital_goods
-                    update_capital_goods(article_url, value=1 if relevant else 0)
-                except Exception:
-                    pass
-        unreviewed = [i for i, r in enumerate(records) if not r.get("_reviewed")]
-        after = [i for i in unreviewed if i > idx]
-        if after:
-            st.session_state.index = after[0]
-        elif unreviewed:
-            st.session_state.index = unreviewed[0]
-        # else: stay at idx (all reviewed)
-        # Note: no st.rerun() here — Streamlit reruns automatically after on_click callbacks
-
-    btn1, btn2, btn3 = st.columns(3)
-    with btn1:
-        st.button("✅ Relevante", width="stretch", type="primary",
-                  on_click=_label, args=(True,),
-                  help="Artigo É relevante — o screener errou ao descartar")
-    with btn2:
-        st.button("❌ Não Relevante", width="stretch",
-                  on_click=_label, args=(False,),
-                  help="Artigo NÃO é relevante — confirma o descarte")
-    with btn3:
-        if st.button("⏭ Pular", width="stretch", help="Revisar depois"):
-            st.session_state.index = min(total - 1, idx + 1)
-            st.rerun()
-
-    # Sidebar
-    with st.sidebar:
-        st.header("Navegação")
-
-        filter_type = st.radio(
-            "Tipo",
-            ["Todos", "🟢 Aprovados", "🟡 Near-miss"],
-            index=0,
-        )
-
-        filter_opt = st.radio(
-            "Status",
-            ["Todos", "Não revisados", "Relevantes", "Irrelevantes"],
-            index=1,
-        )
-
-        # Aplica filtro de tipo
+        # ── Compute visible indices from filters ────────────────────────────
         if filter_type == "🟢 Aprovados":
             type_filtered = [i for i, r in enumerate(records) if r.get("candidate_type") == "approved"]
         elif filter_type == "🟡 Near-miss":
@@ -405,7 +314,6 @@ if _review_active:
         else:
             type_filtered = list(range(total))
 
-        # Aplica filtro de status sobre o resultado do filtro de tipo
         if filter_opt == "Não revisados":
             visible = [i for i in type_filtered if not records[i].get("_reviewed")]
         elif filter_opt == "Relevantes":
@@ -415,28 +323,206 @@ if _review_active:
         else:
             visible = type_filtered
 
-        if visible:
-            titles = [
-                f"{'✅' if records[i].get('relevant_yes_no') is True else '❌' if records[i].get('relevant_yes_no') is False else '⬜'} "
-                f"{'🟢' if records[i].get('candidate_type') == 'approved' else '🟡'} "
-                f"{records[i].get('title', '')[:45]}..."
-                for i in visible
-            ]
-            chosen = st.selectbox("Ir para artigo", range(len(visible)), format_func=lambda x: titles[x])
-            if st.button("Ir"):
-                st.session_state.index = visible[chosen]
-                st.rerun()
+        # ── Pagination ──────────────────────────────────────────────────────
+        _PAGE_SIZE = 100
+        n_pages = max(1, (len(visible) + _PAGE_SIZE - 1) // _PAGE_SIZE)
+        st.session_state["_n_pages"] = n_pages
 
-        st.divider()
-        st.header("Exportar")
-        if st.button("Salvar para labeled/", width="stretch"):
-            out = export_labeled(records)
-            st.success(f"Salvo em:\n`{out}`")
-            st.code(
-                "python -m data.ingest_history\n"
-                "python -m data.calibrate_threshold",
-                language="bash",
+        if "rv_page" not in st.session_state:
+            st.session_state.rv_page = 0
+        # Clamp page index when filter changes shrink the page count
+        if st.session_state.rv_page >= n_pages:
+            st.session_state.rv_page = 0
+
+        page = st.session_state.rv_page
+        page_visible = visible[page * _PAGE_SIZE : (page + 1) * _PAGE_SIZE]
+
+        # Store page_visible for bulk callbacks — avoids closure issues
+        st.session_state["_page_visible"] = page_visible
+
+        # ── Callbacks ───────────────────────────────────────────────────────
+        def _select_all_page() -> None:
+            for i in st.session_state.get("_page_visible", []):
+                st.session_state[f"sel_{i}"] = True
+
+        def _deselect_all_page() -> None:
+            for i in st.session_state.get("_page_visible", []):
+                st.session_state[f"sel_{i}"] = False
+
+        def _bulk_label(relevant: bool) -> None:
+            selected = [
+                i for i in st.session_state.get("_page_visible", [])
+                if st.session_state.get(f"sel_{i}", False)
+            ]
+            if not selected:
+                return
+            updated = list(st.session_state.records)
+            for i in selected:
+                updated[i] = {**updated[i], "relevant_yes_no": relevant, "_reviewed": True}
+                st.session_state[f"sel_{i}"] = False  # uncheck after labeling
+            st.session_state.records = updated
+            save_candidates(updated)
+
+        def _go_prev() -> None:
+            st.session_state.rv_page = max(0, st.session_state.rv_page - 1)
+
+        def _go_next() -> None:
+            st.session_state.rv_page = min(
+                st.session_state.get("_n_pages", 1) - 1,
+                st.session_state.rv_page + 1,
             )
+
+        # ── All-reviewed banner ─────────────────────────────────────────────
+        if remaining == 0:
+            st.success("Todos os artigos foram revisados!")
+            if st.button(
+                "Exportar para feedback/labeled/ e preparar ingest",
+                type="primary",
+                key="rv_export_all",
+            ):
+                out = export_labeled(records)
+                st.success(f"Exportado: `{out}`")
+                st.code(
+                    "python -m data.ingest_history\n"
+                    "python -m data.calibrate_threshold",
+                    language="bash",
+                )
+
+        if not visible:
+            st.info(
+                "Nenhum artigo corresponde aos filtros selecionados. "
+                "Mude o filtro de **Status** para **Todos** para ver candidatos já revisados."
+            )
+        else:
+            # Count selected on this page (computed before widgets render)
+            n_selected = sum(
+                1 for i in page_visible
+                if st.session_state.get(f"sel_{i}", False)
+            )
+
+            # ── Toolbar ─────────────────────────────────────────────────────
+            tb1, tb2, tb3, tb4, tb5, tb6 = st.columns([1.2, 1.2, 2, 2, 0.9, 0.9])
+            with tb1:
+                st.button(
+                    "☑ Todos",
+                    width="stretch",
+                    on_click=_select_all_page,
+                    key="rv_sel_all",
+                    help="Seleciona todos os artigos desta página",
+                )
+            with tb2:
+                st.button(
+                    "⬜ Nenhum",
+                    width="stretch",
+                    on_click=_deselect_all_page,
+                    key="rv_sel_none",
+                    help="Desmarca todos",
+                )
+            with tb3:
+                st.button(
+                    f"✅ Relevante ({n_selected})",
+                    width="stretch",
+                    type="primary",
+                    on_click=_bulk_label,
+                    args=(True,),
+                    disabled=n_selected == 0,
+                    key="rv_bulk_rel",
+                    help="Marca selecionados como Relevantes",
+                )
+            with tb4:
+                st.button(
+                    f"❌ Irrelevante ({n_selected})",
+                    width="stretch",
+                    on_click=_bulk_label,
+                    args=(False,),
+                    disabled=n_selected == 0,
+                    key="rv_bulk_irr",
+                    help="Marca selecionados como Não Relevantes",
+                )
+            with tb5:
+                st.button(
+                    "◀",
+                    width="stretch",
+                    on_click=_go_prev,
+                    disabled=page == 0,
+                    key="rv_prev",
+                    help="Página anterior",
+                )
+            with tb6:
+                st.button(
+                    "▶",
+                    width="stretch",
+                    on_click=_go_next,
+                    disabled=page >= n_pages - 1,
+                    key="rv_next",
+                    help="Próxima página",
+                )
+
+            st.caption(
+                f"{len(visible)} artigos visíveis · página **{page + 1}/{n_pages}**"
+                f" · {n_selected} selecionados · {remaining} pendentes"
+            )
+
+            st.divider()
+
+            # ── Column headers ──────────────────────────────────────────────
+            hc0, hc1, hc2, hc3, hc4, hc5, hc6 = st.columns([0.5, 0.7, 5, 1.5, 1, 1.2, 2])
+            hc0.markdown("**☑**")
+            hc1.markdown("**Tipo**")
+            hc2.markdown("**Título**")
+            hc3.markdown("**Tickers**")
+            hc4.markdown("**Score**")
+            hc5.markdown("**Tier**")
+            hc6.markdown("**Fonte / Data**")
+            st.divider()
+
+            # ── Article list (current page only — max 25 rows) ──────────────
+            for i in page_visible:
+                r = records[i]
+                rv_val = r.get("relevant_yes_no")
+                reviewed = r.get("_reviewed", False)
+                status_icon = (
+                    "✅" if (reviewed and rv_val is True)
+                    else "❌" if (reviewed and rv_val is False)
+                    else "⬜"
+                )
+                type_icon = "🟢" if r.get("candidate_type") == "approved" else "🟡"
+                title = r.get("title", "(sem título)")
+                tickers = ", ".join(r.get("predicted_tickers", [])) or "—"
+                score = r.get("relevance_score", 0)
+                tier = r.get("tier", "—")
+                source = r.get("source", "—")
+                date = r.get("date", "—")
+                url = r.get("url", "")
+
+                c0, c1, c2, c3, c4, c5, c6 = st.columns([0.5, 0.7, 5, 1.5, 1, 1.2, 2])
+                with c0:
+                    st.checkbox(
+                        label="sel",
+                        key=f"sel_{i}",
+                        label_visibility="collapsed",
+                    )
+                with c1:
+                    st.markdown(f"{status_icon} {type_icon}")
+                with c2:
+                    title_md = f"**{title[:90]}{'…' if len(title) > 90 else ''}**"
+                    if url:
+                        title_md += f" [🔗]({url})"
+                    st.markdown(title_md)
+                with c3:
+                    st.markdown(tickers)
+                with c4:
+                    st.markdown(f"`{score:.3f}`")
+                with c5:
+                    st.markdown(f"`{tier}`")
+                with c6:
+                    st.markdown(f"{source[:22]}  \n{date}")
+
+                if r.get("body"):
+                    with st.expander("Ver texto", expanded=False):
+                        st.write(r["body"][:2000])
+
+                st.divider()
 
 
 # ============================================================
@@ -489,32 +575,29 @@ def _section(title: str, render):
         st.error(f"❌ Falha em '{title}': {exc}")
 
 
-with tab_stats:
-    st.title("📈 Dashboard — Saúde do Pipeline")
-    st.caption("Histórico de coleta, screening e detecção de problemas de scraping")
+def _render_stats() -> None:
+    """Conteúdo do dashboard de estatísticas.
 
-    col_refresh2, _ = st.columns([1, 5])
-    with col_refresh2:
-        if st.button("🔄 Atualizar", width="stretch", key="refresh_stats"):
-            st.cache_data.clear()
-            st.rerun()
+    Usa `return` antecipado em vez de `st.stop()` — st.stop() dentro de um
+    context manager de tab (with tab_stats:) levanta StopException que pode
+    corromper o registro de widgets de outros tabs, causando que callbacks
+    on_click não disparem mesmo em tabs já renderizados.
+    """
+    import pandas as pd
+    import numpy as np
 
     audit_records = load_audit_logs()
     if not audit_records:
-        st.warning("Nenhum `output/screening_audit_*.jsonl` encontrado. Execute o pipeline primeiro.")
-        st.stop()
-
-    try:
-        import pandas as pd
-        import numpy as np
-    except ImportError as exc:
-        st.error(f"Dependência faltando: {exc}")
-        st.stop()
+        st.warning(
+            "Nenhum `output/screening_audit_*.jsonl` encontrado. "
+            "Execute o pipeline primeiro."
+        )
+        return
 
     df_full = _build_audit_df(audit_records)
     if df_full.empty:
         st.warning("Audit logs vazios após parsing.")
-        st.stop()
+        return
 
     # --- Date range filter ---
     min_d = df_full["date"].min().date()
@@ -536,7 +619,7 @@ with tab_stats:
 
     if df.empty:
         st.warning("Nenhum registro no período selecionado.")
-        st.stop()
+        return
 
     # =========================================================
     # KPIs
@@ -641,7 +724,7 @@ with tab_stats:
             display["Média hist./dia"] = display["Média hist./dia"].round(1)
             display["Média 3d"] = display["Média 3d"].round(1)
             display["Queda %"] = display["Queda %"].round(0).astype(int).astype(str) + "%"
-            st.dataframe(display, width="stretch", hide_index=True)
+            st.dataframe(display, use_container_width=True, hide_index=True)
 
     _section("Alertas", _render_alerts)
     st.divider()
@@ -738,7 +821,7 @@ with tab_stats:
             "→LLM", "Taxa aprov %", "Score médio", "Última coleta", "Dias parada",
         ]
         display["Última coleta"] = display["Última coleta"].dt.strftime("%Y-%m-%d")
-        st.dataframe(display, width="stretch", hide_index=True, height=400)
+        st.dataframe(display, use_container_width=True, hide_index=True, height=400)
 
     _section("Saúde por fonte", _render_source_table)
     st.divider()
@@ -780,7 +863,7 @@ with tab_stats:
             )
             .properties(height=max(300, len(top_sources) * 22))
         )
-        st.altair_chart(chart, width="stretch")
+        st.altair_chart(chart, use_container_width=True)
 
     _section("Heatmap", _render_heatmap)
     st.divider()
@@ -868,3 +951,16 @@ with tab_stats:
             st.line_chart(t_daily, height=320)
 
     _section("Tickers", _render_tickers)
+
+
+with tab_stats:
+    st.title("📈 Dashboard — Saúde do Pipeline")
+    st.caption("Histórico de coleta, screening e detecção de problemas de scraping")
+
+    col_refresh2, _ = st.columns([1, 5])
+    with col_refresh2:
+        if st.button("🔄 Atualizar", width="stretch", key="refresh_stats"):
+            st.cache_data.clear()
+            st.rerun()
+
+    _render_stats()

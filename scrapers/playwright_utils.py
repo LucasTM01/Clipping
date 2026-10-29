@@ -8,6 +8,7 @@ import os
 import re
 from contextlib import contextmanager
 from datetime import datetime, time, timezone, timedelta
+from pathlib import Path
 from typing import Iterator, Optional
 
 logger = logging.getLogger(__name__)
@@ -81,79 +82,134 @@ def _find_chrome_user_data() -> str | None:
     return None
 
 
+PIPELINE_PROFILE = Path.home() / ".clipping" / "pipeline_profile"
+
+_PERSISTENT_STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
+_PERSISTENT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _launch_profile(p, user_data_dir: str, headless: bool, locale: str):
+    ctx = p.chromium.launch_persistent_context(
+        user_data_dir=user_data_dir,
+        headless=headless,
+        channel="chrome",
+        args=_PERSISTENT_STEALTH_ARGS,
+        user_agent=_PERSISTENT_UA,
+        locale=locale,
+        viewport={"width": 1920, "height": 1080},
+        timeout=30_000,
+    )
+    ctx.add_init_script(_STEALTH_INIT_SCRIPT)
+    return ctx
+
+
+def _launch_best_context(p, headless: bool, user_data_dir: str | None, locale: str):
+    """Abre o melhor contexto disponível. Retorna (ctx, browser_ou_None)."""
+    # --- Tentativa 1: perfil dedicado do pipeline (nunca está bloqueado) ---
+    if PIPELINE_PROFILE.exists():
+        try:
+            ctx = _launch_profile(p, str(PIPELINE_PROFILE), headless, locale)
+            logger.info("Playwright: usando perfil dedicado do pipeline (%s)", PIPELINE_PROFILE)
+            return ctx, None
+        except Exception as e:
+            logger.warning("Playwright: perfil dedicado indisponível (%s).", e)
+
+    # --- Tentativa 2: perfil real do Chrome (traz todos os cookies) ---
+    # Falha se o Chrome estiver aberto (perfil bloqueado) e, no Chrome 136+,
+    # sempre: automação no User Data padrão foi bloqueada pelo Google.
+    if user_data_dir:
+        try:
+            ctx = _launch_profile(p, user_data_dir, headless, locale)
+            logger.debug("Playwright: usando perfil real do Chrome (%s)", user_data_dir)
+            return ctx, None
+        except Exception as e:
+            logger.warning(
+                "Playwright: perfil Chrome indisponível (%s) — "
+                "usando sessão stealth com cookies do Chrome.", str(e).splitlines()[0]
+            )
+
+    # --- Fallback: Chrome limpo + cookies extraídos do SQLite do Chrome ---
+    # Extrai os cookies diretamente do banco SQLite do Chrome e injeta na
+    # sessão limpa, para que Cloudflare/DataDome reconheçam a sessão existente.
+    browser = p.chromium.launch(
+        headless=headless,
+        channel="chrome",
+        args=_PERSISTENT_STEALTH_ARGS,
+    )
+    ctx = browser.new_context(
+        user_agent=_PERSISTENT_UA,
+        locale=locale,
+        viewport={"width": 1920, "height": 1080},
+    )
+    ctx.add_init_script(_STEALTH_INIT_SCRIPT)
+
+    try:
+        from scrapers.chrome_cookies import get_playwright_cookies
+        cookies = get_playwright_cookies([
+            "reuters.com", ".reuters.com",
+            "bloomberg.com", ".bloomberg.com",
+        ])
+        if cookies:
+            ctx.add_cookies(cookies)
+            logger.info(
+                "Playwright: %d cookies do Chrome injetados na sessão stealth "
+                "(Cloudflare + login Reuters/Bloomberg)", len(cookies)
+            )
+        else:
+            logger.debug("Playwright: nenhum cookie extraído do Chrome — sessão anônima")
+    except Exception as cookie_exc:
+        logger.debug("Playwright: falha ao injetar cookies: %s", cookie_exc)
+
+    logger.debug("Playwright: usando sessão stealth com cookies do Chrome")
+    return ctx, browser
+
+
 @contextmanager
 def persistent_browser_context(
     headless: bool = True,
     user_data_dir: str | None = None,
+    locale: str = "pt-BR",
 ) -> Iterator:
-    """Contexto Playwright usando o perfil real do Chrome do usuário.
+    """Contexto Playwright com sessão persistente (cookies) para sites protegidos.
 
-    Isso carrega todos os cookies e sessões do Chrome, tornando o browser
-    indistinguível de uma visita humana (incluindo cookies de login em sites
-    como Reuters). Se o Chrome já estiver aberto (perfil bloqueado) ou não
-    for encontrado, faz fallback para uma sessão stealth limpa.
+    Hierarquia de tentativas (cada uma faz fallback para a próxima):
+
+    1. Perfil dedicado do pipeline (~/.clipping/pipeline_profile/) — perfil
+       separado que nunca está aberto durante o pipeline. Configurado via
+       tools/setup_pipeline_browser.py (login manual único).
+
+    2. Perfil real do Chrome do usuário — traz todos os cookies e sessões.
+       Falha se Chrome estiver aberto (perfil bloqueado) ou no Chrome 136+.
+
+    3. Sessão stealth + cookies extraídos do SQLite do Chrome — injetados no
+       browser limpo via DPAPI. Sem cookies, vira sessão stealth anônima.
+
+    O browser é aberto ANTES do ``yield``: uma exceção dentro do bloco ``with``
+    do chamador é propagada normalmente, sem disparar a próxima tentativa.
 
     Args:
         headless: Roda sem janela visível (default True).
         user_data_dir: Caminho explícito do User Data do Chrome. Se None,
             detecta automaticamente no Windows.
+        locale: Locale enviado aos sites.
     """
     from playwright.sync_api import sync_playwright
-
-    _STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
-    _UA = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
 
     if user_data_dir is None:
         user_data_dir = _find_chrome_user_data()
 
     with sync_playwright() as p:
-        # --- Tentativa 1: perfil real do Chrome (traz todos os cookies) ---
-        if user_data_dir:
-            try:
-                ctx = p.chromium.launch_persistent_context(
-                    user_data_dir=user_data_dir,
-                    headless=headless,
-                    channel="chrome",
-                    args=_STEALTH_ARGS,
-                    user_agent=_UA,
-                    locale="pt-BR",
-                    viewport={"width": 1920, "height": 1080},
-                )
-                ctx.add_init_script(_STEALTH_INIT_SCRIPT)
-                logger.debug("Playwright: usando perfil real do Chrome (%s)", user_data_dir)
-                try:
-                    yield ctx
-                finally:
-                    ctx.close()
-                return
-            except Exception as e:
-                logger.warning(
-                    "Playwright: perfil Chrome indisponível (%s) — "
-                    "Chrome pode estar aberto. Usando sessão stealth limpa.", e
-                )
-
-        # --- Fallback: Chrome limpo com stealth (sem cookies de sessão) ---
-        browser = p.chromium.launch(
-            headless=headless,
-            channel="chrome",
-            args=_STEALTH_ARGS,
-        )
-        ctx = browser.new_context(
-            user_agent=_UA,
-            locale="pt-BR",
-            viewport={"width": 1920, "height": 1080},
-        )
-        ctx.add_init_script(_STEALTH_INIT_SCRIPT)
-        logger.debug("Playwright: usando sessão stealth limpa (sem perfil)")
+        ctx, browser = _launch_best_context(p, headless, user_data_dir, locale)
         try:
             yield ctx
         finally:
             ctx.close()
-            browser.close()
+            if browser is not None:
+                browser.close()
 
 
 _DATE_TEXT_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")

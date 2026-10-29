@@ -62,7 +62,7 @@ def screen_articles_v2(articles: list[Article]) -> list[ScoredArticle]:
 
     # Embeddings em batch
     texts = [
-        f"{a.title}\n\n{a.full_text[:4000]}" if a.full_text.strip() else a.title
+        f"{a.title}\n\n{(a.full_text or '')[:4000]}" if (a.full_text or "").strip() else a.title
         for a in unique
     ]
     embeddings: np.ndarray = model.encode(
@@ -85,32 +85,42 @@ def screen_articles_v2(articles: list[Article]) -> list[ScoredArticle]:
     passed: list[ScoredArticle] = []
     with open(audit_path, "a", encoding="utf-8") as audit_file:
         for article, emb in zip(unique, embeddings):
-            candidate = scorer.build_candidate(article, emb)
-            scored = scorer.score(candidate)
+            try:
+                candidate = scorer.build_candidate(article, emb)
+                scored = scorer.score(candidate)
 
-            sent = scored.tier in ("high", "medium")
-            audit_entry = {
-                "timestamp": datetime.now().isoformat(),
-                "title": article.title,
-                "url": article.url,
-                "source": article.source,
-                "relevance_score": round(scored.relevance_score, 4),
-                "tier": scored.tier,
-                "predicted_tickers": scored.predicted_tickers,
-                "ticker_confidence": {k: round(v, 3) for k, v in scored.ticker_confidence.items()},
-                "rationale": scored.rationale,
-                "sent_to_analysis": sent,
-            }
+                sent = scored.tier in ("high", "medium")
+                audit_entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "title": article.title,
+                    "url": article.url,
+                    "source": article.source,
+                    "relevance_score": round(scored.relevance_score, 4),
+                    "tier": scored.tier,
+                    "predicted_tickers": scored.predicted_tickers,
+                    "ticker_confidence": {k: round(v, 3) for k, v in scored.ticker_confidence.items()},
+                    "rationale": scored.rationale,
+                    "sent_to_analysis": sent,
+                }
 
-            if clf is not None:
-                score_clf = float(clf.predict_proba(emb.reshape(1, -1))[0, 1])
-                audit_entry["score_clf"] = round(score_clf, 4)
+                if clf is not None:
+                    try:
+                        score_clf = float(clf.predict_proba(emb.reshape(1, -1))[0, 1])
+                        audit_entry["score_clf"] = round(score_clf, 4)
+                    except Exception as clf_err:
+                        log.debug(f"Classifier predict falhou: {clf_err}")
 
-            audit_file.write(json.dumps(audit_entry, ensure_ascii=False) + "\n")
-            upsert_article(scored)
+                audit_file.write(json.dumps(audit_entry, ensure_ascii=False) + "\n")
+                upsert_article(scored)
 
-            if scored.tier != "discard":
-                passed.append(scored)
+                if scored.tier != "discard":
+                    passed.append(scored)
+
+            except Exception as e:
+                log.error(
+                    f"Screener: falha ao pontuar '{article.title[:60]}': {e}",
+                    exc_info=True,
+                )
 
     n_high = sum(1 for s in passed if s.tier == "high")
     n_medium = sum(1 for s in passed if s.tier == "medium")

@@ -33,10 +33,9 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-import feedparser
 
 from config.settings import MAX_ARTICLE_AGE_HOURS, RSS_FEEDS
-from fetcher.rss_fetcher import Article, _is_recent, _parse_published_date
+from fetcher.rss_fetcher import Article, _is_recent, _parse_published_date, fetch_feed
 
 
 # ---------------------------------------------------------------------------
@@ -66,9 +65,9 @@ def _probe_rss(name: str, url: str, language: str, lookback_hours: int) -> Probe
     res.extra["url"] = url
 
     try:
-        feed = feedparser.parse(url)
+        feed = fetch_feed(url)
     except Exception as exc:
-        res.error = f"feedparser raised: {exc!r}"
+        res.error = f"feed fetch raised: {exc!r}"
         res.elapsed_s = time.perf_counter() - start
         return res
 

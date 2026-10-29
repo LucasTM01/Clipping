@@ -26,8 +26,15 @@ log = logging.getLogger(__name__)
 
 
 def _make_text(record: dict) -> str:
-    body = (record.get("body") or "").strip()
     title = record.get("title", "")
+    # Fallback chain: body (historical) → full_text (pipeline) → content → text
+    body = (
+        record.get("body")
+        or record.get("full_text")
+        or record.get("content")
+        or record.get("text")
+        or ""
+    ).strip()
     if body:
         return f"{title}\n\n{body[:4000]}"
     return title
@@ -88,6 +95,16 @@ def _load_feedback_labeled() -> list[dict]:
     return records
 
 
+def _keyword_tickers(text: str) -> list[str]:
+    """
+    Keyword backfill: retorna tickers cujas keywords aparecem no texto.
+    Usado quando o registro não tem ticker explícito nem all_tickers.
+    Usa o mesmo matcher por limite de palavra do screener (ticker_classifier).
+    """
+    from screener.ticker_classifier import _keyword_fallback
+    return list(_keyword_fallback(text).keys())
+
+
 def ingest(jsonl_path: Path = JSONL_PATH) -> dict:
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -141,13 +158,28 @@ def ingest(jsonl_path: Path = JSONL_PATH) -> dict:
         normalize_embeddings=True,
     )
 
+    def _resolve_tickers(r: dict) -> list[str]:
+        # Registros reclassificados manualmente trazem tickers autoritativos:
+        # usa-os verbatim (lista vazia = macro), sem keyword backfill.
+        if r.get("_reclassified"):
+            return [t for t in (r.get("all_tickers") or []) if t]
+        # Priority: all_tickers (list) > ticker (singular) > keyword backfill
+        raw = (
+            r.get("all_tickers")
+            or ([r["ticker"]] if r.get("ticker") else [])
+        )
+        if not raw:
+            body_text = r.get("body") or r.get("full_text") or ""
+            raw = _keyword_tickers(r.get("title", "") + " " + body_text)
+        return [t for t in raw if t]
+
     examples = [
         HistoricalExample(
             id=_record_id(r),
             title=r.get("title", ""),
             body=r.get("body"),
             embedding=embeddings[i],
-            tickers=[r["ticker"]] if r.get("ticker") else [],
+            tickers=_resolve_tickers(r),
             sectors=[],
             label=r["_label"],
             published_at=_parse_date(r.get("date")),

@@ -1,280 +1,237 @@
-"""Bloomberg industry scraper.
+"""Bloomberg scrapers via Bloomberg's own public feeds.
 
-Covers:
-  - Transportation: https://www.bloomberg.com/industries/transportation
-  - Energy:         https://www.bloomberg.com/industries/energy
+Covers (one BloombergScraper instance per section, see registry.py):
+  - "Bloomberg Energy"          — energy/power/oil & gas stories
+  - "Bloomberg Transportation"  — aviation, autos, trucking, rail, shipping
+  - "Bloomberg Industries"      — remaining Industries-feed stories (e.g.
+                                  Caterpillar, industrial earnings)
 
-Bloomberg blocks plain requests and headless Chromium with fingerprinting.
-Access requires real Chrome (channel="chrome") + stealth init script.
+The /industries/<x> pages are behind PerimeterX ("Are you a robot?") for any
+automated browser, which is why these sources delivered 0 articles every day.
+Two public, crawler-facing feeds give the same stories without a browser:
 
-Listing data comes from Bloomberg's internal JSON pagination API
-(lineup-next/api/paginate), which returns exact ISO-8601 publishedAt
-timestamps and clean headlines — no date parsing needed.
+  1. Google News sitemap ``/sitemaps/news/latest.xml`` — every Bloomberg story
+     of the last ~2 days with exact ``publication_date`` and headline, but no
+     section information.
+  2. Industries RSS ``/feeds/industries/news.rss`` — the latest ~20 Industries
+     stories, each with a one-paragraph description (used as ``full_text``).
 
-Article body is extracted pre-paywall: Bloomberg serves 1-2 paragraphs
-server-rendered before the JS paywall wall fires. trafilatura grabs them.
+Both are fetched once per run (module-level cache shared by the instances)
+and every story is assigned to exactly ONE section by headline/slug keywords
+(transportation first, then energy, then Industries-feed leftovers), so the
+same URL never appears under two sources. Sitemap stories that match neither
+keyword set (politics, markets, ...) are dropped.
+
+Article bodies are paywalled; the pipeline does not try trafilatura on
+bloomberg.com (see ``fetcher.rss_fetcher._NO_ENRICH_DOMAINS``).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from html import unescape
+from typing import Optional
 
-import trafilatura
+import feedparser
+import requests
 
-from fetcher.rss_fetcher import Article
-from scrapers.playwright_utils import browser_context, extract_published_at
+from fetcher.rss_fetcher import Article, _parse_published_date
 
 logger = logging.getLogger(__name__)
 
 _BASE = "https://www.bloomberg.com"
-_PAGINATE_URL = (
-    _BASE
-    + "/lineup-next/api/paginate"
-    "?id=archive_story_list"
-    "&page={page_id}"
-    "&offset={offset}"
-    "&variation=archive"
-    "&type=lineup_content"
-    "&locale=en"
-)
-_PAGE_SIZE = 12
+_SITEMAP_URL = f"{_BASE}/sitemaps/news/latest.xml"
+_INDUSTRIES_RSS_URL = f"{_BASE}/feeds/industries/news.rss"
 
-# JS executed inside the browser to call Bloomberg's internal paginate API
-# using the session credentials already established by the page visit.
-_FETCH_JS = """
-async (url) => {
-    const r = await fetch(url, {credentials: "include"});
-    if (!r.ok) return null;
-    return r.json();
-}
-"""
-
-
-def _parse_items(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract item list from a paginate API response dict."""
-    return data.get("archive_story_list", {}).get("items", [])
-
-
-def _extract_items_from_html(html: str) -> list[dict[str, Any]]:
-    """Extract the offset=0 items embedded in Bloomberg's __NEXT_DATA__ script.
-
-    Bloomberg embeds the first page of articles server-side; the paginate API
-    only returns subsequent pages (offset>=12).  We parse __NEXT_DATA__ to
-    recover these first items without a second network call.
-    """
-    m = re.search(
-        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-        html, flags=re.DOTALL | re.IGNORECASE,
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
     )
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return []
+}
 
-    # Walk the nested props tree looking for archive_story_list.items
-    raw = json.dumps(data)
-    # Fast path: search for publishedAt patterns and reconstruct minimal dicts
-    # using the full data walk
-    results: list[dict[str, Any]] = []
-    _walk_for_items(data, results)
-    return results
+# Only news stories — opinion columns, newsletters and live blogs are skipped.
+_STORY_PATH_RE = re.compile(r"^https://www\.bloomberg\.com/news/(?:articles|features)/")
+
+_URL_BLOCK_RE = re.compile(r"<url>(.*?)</url>", re.DOTALL)
+_LOC_RE = re.compile(r"<loc>([^<]+)</loc>")
+_PUB_DATE_RE = re.compile(r"<news:publication_date>([^<]+)</news:publication_date>")
+_TITLE_RE = re.compile(
+    r"<news:title>(?:<!\[CDATA\[(.*?)\]\]>|([^<]*))</news:title>", re.DOTALL
+)
+
+SECTION_ENERGY = "energy"
+SECTION_TRANSPORTATION = "transportation"
+SECTION_INDUSTRIES = "industries"
+
+# Matched against headline + URL slug (lowercase, hyphens → spaces).
+_TRANSPORTATION_RE = re.compile(
+    r"\b(?:airlines?|aircraft|airplanes?|airbus|boeing|embraer|bombardier|jets?|"
+    r"jetliners?|aviation|aerospace|airports?|flights?|fighter|lockheed|rheinmetall|"
+    r"northrop|saab|"
+    r"trucks?|trucking|truckers?|freight|shipping|shipbuild\w*|containers?|ports?|"
+    r"rail|railroads?|railways?|locomotives?|cars?|automakers?|carmakers?|autos?|"
+    r"auto ?parts|evs?|electric vehicles?|tesla|toyota|volkswagen|vw|general motors|"
+    r"ford|stellantis|byd|geely|hyundai|kia|nissan|honda|renault|mercedes|bmw|volvo|"
+    r"daimler|scania|traton|paccar|cummins|logistics|fedex|maersk|buses|tires?)\b",
+    re.IGNORECASE,
+)
+_ENERGY_RE = re.compile(
+    r"\b(?:energy|oil|crude|brent|wti|opec\+?|gas|lng|gasoline|diesel|fuel|refiner(?:y|ies|s)?|"
+    r"pipelines?|power|electricity|grid|utilit(?:y|ies)|solar|"
+    r"offshore wind|onshore wind|wind (?:power|farms?|turbines?|energy|projects?)|renewables?|"
+    r"nuclear|uranium|coal|hydro\w*|batter(?:y|ies)|hydrogen|transformers?|turbines?|"
+    r"biofuels?|ethanol|emissions|carbon|petrobras|exxon|chevron|shell|bp|"
+    r"totalenergies|aramco|equinor|sinopec|petrochina|cnooc|conocophillips|"
+    r"data centers? power)\b",
+    re.IGNORECASE,
+)
+
+_CACHE_TTL_S = 600
+_cache: dict[str, tuple[float, list["_Story"]]] = {}
 
 
-def _walk_for_items(node: Any, out: list[dict[str, Any]]) -> None:
-    """Recursively find dicts that look like Bloomberg article items."""
-    if isinstance(node, list):
-        for item in node:
-            _walk_for_items(item, out)
-    elif isinstance(node, dict):
-        if "headline" in node and "publishedAt" in node and "url" in node:
-            out.append(node)
-        else:
-            for v in node.values():
-                _walk_for_items(v, out)
+@dataclass
+class _Story:
+    url: str
+    title: str
+    pub_date: datetime
+    summary: str = ""
+    in_industries_feed: bool = False
 
 
 def _to_utc(iso: str) -> Optional[datetime]:
     try:
-        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
+        return datetime.fromisoformat(iso.strip().replace("Z", "+00:00")).astimezone(timezone.utc)
     except (ValueError, AttributeError):
         return None
 
 
-class BloombergScraper:
-    """Scraper for a single Bloomberg industry page.
+def parse_sitemap(xml_text: str) -> list[_Story]:
+    """Extract news stories (url, title, publication date) from the news sitemap."""
+    stories: list[_Story] = []
+    for block_m in _URL_BLOCK_RE.finditer(xml_text):
+        block = block_m.group(1)
+        loc_m = _LOC_RE.search(block)
+        if not loc_m:
+            continue
+        url = loc_m.group(1).strip()
+        if not _STORY_PATH_RE.match(url):
+            continue
+        date_m = _PUB_DATE_RE.search(block)
+        pub = _to_utc(date_m.group(1)) if date_m else None
+        title_m = _TITLE_RE.search(block)
+        title = unescape((title_m.group(1) or title_m.group(2) or "").strip()) if title_m else ""
+        if pub is None or not title:
+            continue
+        stories.append(_Story(url=url, title=title, pub_date=pub))
+    return stories
 
-    Instantiate once per industry:
-        BloombergScraper("Bloomberg Transportation", "phx-industries-transportation")
-        BloombergScraper("Bloomberg Energy",         "phx-industries-energy")
+
+def parse_industries_rss(content: bytes | str) -> list[_Story]:
+    """Extract stories (with description) from the Industries RSS feed."""
+    feed = feedparser.parse(content)
+    stories: list[_Story] = []
+    for entry in feed.entries:
+        url = entry.get("link", "").strip()
+        title = entry.get("title", "").strip()
+        pub = _parse_published_date(entry)
+        if not url or not title or pub is None:
+            continue
+        stories.append(_Story(
+            url=url,
+            title=title,
+            pub_date=pub,
+            summary=(entry.get("summary") or "").strip(),
+            in_industries_feed=True,
+        ))
+    return stories
+
+
+def merge_stories(sitemap: list[_Story], industries: list[_Story]) -> list[_Story]:
+    """Union by URL. Industries-feed entries win (they carry the description)."""
+    by_url: dict[str, _Story] = {s.url: s for s in sitemap}
+    for s in industries:
+        by_url[s.url] = s
+    return sorted(by_url.values(), key=lambda s: s.pub_date, reverse=True)
+
+
+def classify(story: _Story) -> Optional[str]:
+    """Assign a story to exactly one section, or None to drop it."""
+    slug = story.url.rstrip("/").rsplit("/", 1)[-1].replace("-", " ")
+    text = f"{story.title} {slug}"
+    if _TRANSPORTATION_RE.search(text):
+        return SECTION_TRANSPORTATION
+    if _ENERGY_RE.search(text):
+        return SECTION_ENERGY
+    if story.in_industries_feed:
+        return SECTION_INDUSTRIES
+    return None
+
+
+def _fetch_text(url: str) -> Optional[str]:
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=20)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        logger.warning(f"Bloomberg: erro ao buscar {url}: {e}")
+        return None
+
+
+def _load_stories() -> list[_Story]:
+    """Fetch + merge both feeds once per run (cached for _CACHE_TTL_S)."""
+    cached = _cache.get("stories")
+    if cached and time.monotonic() - cached[0] < _CACHE_TTL_S:
+        return cached[1]
+
+    sitemap_xml = _fetch_text(_SITEMAP_URL)
+    rss_text = _fetch_text(_INDUSTRIES_RSS_URL)
+    sitemap = parse_sitemap(sitemap_xml) if sitemap_xml else []
+    industries = parse_industries_rss(rss_text) if rss_text else []
+    logger.info(
+        f"Bloomberg: {len(sitemap)} matérias no sitemap, {len(industries)} no feed Industries"
+    )
+    stories = merge_stories(sitemap, industries)
+    if sitemap_xml is not None or rss_text is not None:
+        _cache["stories"] = (time.monotonic(), stories)
+    return stories
+
+
+class BloombergScraper:
+    """Scraper for one Bloomberg section (see module docstring).
+
+        BloombergScraper("Bloomberg Energy",         "energy")
+        BloombergScraper("Bloomberg Transportation", "transportation")
+        BloombergScraper("Bloomberg Industries",     "industries")
     """
 
     language: str = "en"
 
-    def __init__(self, name: str, page_id: str, max_pages: Optional[int] = None) -> None:
+    def __init__(self, name: str, section: str) -> None:
         self.name = name
-        self.page_id = page_id
-        self.base_url = f"{_BASE}/industries/{page_id.removeprefix('phx-industries-')}"
-        from config.settings import SCRAPER_MAX_PAGES, SCRAPER_CONCURRENCY, BLOOMBERG_LOOKBACK_HOURS
-        self.max_pages = max_pages if max_pages is not None else SCRAPER_MAX_PAGES
-        self.concurrency = SCRAPER_CONCURRENCY
-        self.lookback_hours = BLOOMBERG_LOOKBACK_HOURS
+        self.section = section
+        self.base_url = f"{_BASE}/industries/{section}" if section != SECTION_INDUSTRIES else f"{_BASE}/industries"
 
     def fetch_articles(self, since: datetime) -> list[Article]:
-        from playwright.sync_api import TimeoutError as PWTimeout
-
-        # Bloomberg industry pages are curated digests that update infrequently.
-        # We collect everything available up to max_pages and rely on the
-        # screener's Qdrant novelty detection for deduplication rather than a
-        # fixed time window that would silently skip content on quiet weeks.
-        # The lookback_hours cap prevents unbounded historical crawls.
-        effective_since = datetime.now(timezone.utc) - timedelta(hours=self.lookback_hours)
-        # Honor the caller's since if it asks for an even wider window.
-        effective_since = min(effective_since, since)
-        logger.debug(f"{self.name}: effective_since={effective_since.isoformat()}")
-
-        results: list[Article] = []
-
-        with browser_context(channel="chrome", stealth=True, locale="en-US") as ctx:
-            listing_page = ctx.new_page()
-            try:
-                listing_page.goto(
-                    self.base_url, wait_until="networkidle", timeout=45_000
-                )
-            except PWTimeout:
-                logger.warning(f"{self.name}: timeout loading listing page")
-                return []
-            except Exception:
-                # networkidle can time out on slow pages; continue with current state
-                pass
-
-            title = listing_page.title().lower()
-            if "robot" in title or "access denied" in title or "are you a" in title:
-                logger.error(
-                    f"{self.name}: Bloomberg bot-detection triggered — "
-                    "ensure Chrome is installed (channel='chrome')"
-                )
-                return []
-
-            # --- Page 0: extract items embedded in __NEXT_DATA__ HTML ---
-            html_items = _extract_items_from_html(listing_page.content())
-            first_page_urls: set[str] = {i.get("url", "") for i in html_items}
-            logger.debug(f"{self.name}: {len(html_items)} items from __NEXT_DATA__")
-
-            all_items: list[dict[str, Any]] = []
-            seen_urls: set[str] = set()
-            stop = False
-
-            def _add_items(items: list[dict[str, Any]]) -> bool:
-                """Append items, return True if we should stop pagination."""
-                for item in items:
-                    url = item.get("url", "")
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    pub = _to_utc(item.get("publishedAt", ""))
-                    if pub is not None and pub < effective_since:
-                        return True
-                    all_items.append(item)
-                return False
-
-            if _add_items(html_items):
-                stop = True
-
-            # --- Pages 1+: fetch via paginate API (offset=12, 24, …) ---
-            if not stop:
-                for page_num in range(1, self.max_pages):
-                    offset = page_num * _PAGE_SIZE
-                    api_url = _PAGINATE_URL.format(page_id=self.page_id, offset=offset)
-                    try:
-                        data = listing_page.evaluate(_FETCH_JS, api_url)
-                    except Exception as e:
-                        logger.warning(f"{self.name}: API call failed (offset={offset}): {e}")
-                        break
-
-                    if not data:
-                        logger.debug(f"{self.name}: empty API response at offset={offset}, stopping")
-                        break
-
-                    items = _parse_items(data)
-                    if not items:
-                        break
-
-                    if _add_items(items):
-                        break
-
-                    logger.debug(
-                        f"{self.name}: API page {page_num} — {len(items)} items, "
-                        f"total so far: {len(all_items)}"
-                    )
-
-            listing_page.close()
-            logger.info(f"{self.name}: {len(all_items)} artigos candidatos da listagem")
-
-            if not all_items:
-                return []
-
-            # --- Fetch article pages sequentially ---
-            article_page = ctx.new_page()
-            for item in all_items:
-                raw_url = item.get("url", "")
-                # __NEXT_DATA__ may have absolute URLs; API items have relative ones.
-                url = raw_url if raw_url.startswith("http") else _BASE + raw_url
-                # Only fetch bloomberg.com article pages; skip external links.
-                if not url.startswith(_BASE + "/"):
-                    continue
-
-                try:
-                    article_page.goto(
-                        url, wait_until="domcontentloaded", timeout=30_000
-                    )
-                    html = article_page.content()
-                except Exception as e:
-                    logger.warning(f"{self.name}: falha ao carregar {url[:80]}: {e}")
-                    continue
-
-                # Use precise timestamp from API; fall back to HTML extraction.
-                # item.get("publishedAt") may return None for JSON null values,
-                # so use `or ""` rather than a default arg to _to_utc.
-                pub = _to_utc(item.get("publishedAt") or "")
-                if pub is None:
-                    pub = extract_published_at(html)
-                if pub is None:
-                    if raw_url in first_page_urls:
-                        pub = datetime.now(timezone.utc)
-                    else:
-                        logger.debug(f"{self.name}: data desconhecida, pulando {url[:80]}")
-                        continue
-                # effective_since already applied at listing stage; honour it here too.
-                if pub < effective_since:
-                    continue
-
-                full_text = trafilatura.extract(
-                    html,
-                    include_comments=False,
-                    include_tables=False,
-                    no_fallback=False,
-                ) or ""
-
-                # If trafilatura got nothing, use the API summary as fallback
-                if not full_text and item.get("summary"):
-                    full_text = item["summary"]
-
-                published_str = pub.isoformat()
-                results.append(Article(
-                    source=self.name,
-                    title=item.get("headline", ""),
-                    url=url,
-                    published_at=published_str,
-                    full_text=full_text,
-                    language=self.language,
-                ))
-            article_page.close()
-
-        logger.info(f"{self.name}: {len(results)} artigos retornados")
-        return results
+        stories = [
+            s for s in _load_stories()
+            if s.pub_date >= since and classify(s) == self.section
+        ]
+        logger.info(f"{self.name}: {len(stories)} artigos")
+        return [
+            Article(
+                source=self.name,
+                title=s.title,
+                url=s.url,
+                published_at=s.pub_date.isoformat(),
+                full_text=s.summary,
+                language=self.language,
+            )
+            for s in stories
+        ]

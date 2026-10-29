@@ -1,11 +1,13 @@
 """
-Novelty detection one-class para triagem de artigos.
+Novelty detection com margin scoring para triagem de artigos.
 
-Fase 1 (só positivos): score = média de similaridade cosseno aos top-k
-vizinhos positivos. Threshold calibrado por LOO-CV em calibrate_threshold.py.
+Score = (mean_pos − mean_neg + 1) / 2  quando negativos estão disponíveis,
+         mean_pos                        caso contrário (fallback).
 
-Fase 2 (com negativos): trocar _compute_score() para classificação binária
-supervisionada sem mudar as interfaces externas.
+Tier boundaries (high/medium/low_review/discard) são lidas de calibration.json
+(campos tier_high e tier_medium) para que reflitam a distribuição real dos scores
+pós-negativos. Fallback para TIER_HIGH/TIER_MEDIUM se o JSON não tiver esses campos
+(retrocompatibilidade com calibrations antigas).
 """
 
 import json
@@ -53,13 +55,18 @@ class RelevanceScorer:
     def __init__(self, store: EmbeddingStore | None = None) -> None:
         self._store = store or EmbeddingStore()
         self._calibration = _load_calibration()
-        self._discard_threshold = (
-            self._calibration.get("threshold", TIER_LOW_REVIEW)
-            if self._calibration
-            else TIER_LOW_REVIEW
+        cal = self._calibration or {}
+        self._discard_threshold = cal.get("threshold", TIER_LOW_REVIEW)
+        # Tier boundaries: read from calibration when available (set by calibrate_threshold.py)
+        # so they reflect the real score distribution post-negatives.
+        self._tier_high   = cal.get("tier_high",   TIER_HIGH)
+        self._tier_medium = cal.get("tier_medium",  TIER_MEDIUM)
+        log.info(
+            f"RelevanceScorer: discard={self._discard_threshold:.3f} "
+            f"tier_medium={self._tier_medium:.3f} tier_high={self._tier_high:.3f} "
+            f"(k={cal.get('k', settings.embedding_top_k)} "
+            f"k_neg={cal.get('k_neg', settings.embedding_top_k_neg)})"
         )
-        log.info(f"RelevanceScorer: discard_threshold={self._discard_threshold:.3f} "
-                 f"(k={self._calibration.get('k', settings.embedding_top_k) if self._calibration else settings.embedding_top_k})")
 
     def score(self, candidate: Candidate) -> ScoredArticle:
         relevance_score = _compute_score(
@@ -70,7 +77,12 @@ class RelevanceScorer:
             candidate.nearest_positives,
             article_text=candidate.article.title + " " + (candidate.article.full_text or ""),
         )
-        tier = _assign_tier(relevance_score, self._discard_threshold)
+        tier = _assign_tier(
+            relevance_score,
+            self._discard_threshold,
+            self._tier_medium,
+            self._tier_high,
+        )
         rationale = _build_rationale(
             relevance_score, tier, candidate.nearest_positives[:3]
         )
@@ -126,12 +138,14 @@ def _compute_score(
 def _assign_tier(
     score: float,
     discard_threshold: float,
+    tier_medium: float = TIER_MEDIUM,
+    tier_high: float = TIER_HIGH,
 ) -> Literal["high", "medium", "low_review", "discard"]:
     if score < discard_threshold:
         return "discard"
-    if score >= TIER_HIGH:
+    if score >= tier_high:
         return "high"
-    if score >= TIER_MEDIUM:
+    if score >= tier_medium:
         return "medium"
     return "low_review"
 

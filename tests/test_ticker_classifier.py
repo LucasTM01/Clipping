@@ -57,14 +57,17 @@ class TestClassifyTickers:
         assert "WEGE3" not in tickers
         assert "EMBR3" in tickers
 
-    def test_confidence_normalized_to_max(self):
+    def test_confidence_normalized_by_score_sum(self):
+        # score_sum = 1.0 + 0.5 = 1.5
+        # EMBR3 confidence = 1.0 / 1.5 ≈ 0.667
+        # WEGE3 confidence = 0.5 / 1.5 ≈ 0.333
         neighbors = _neighbors(
             (["EMBR3"], 1.0),
             (["WEGE3"], 0.5),
         )
         _, conf = classify_tickers(neighbors)
-        assert conf["EMBR3"] == pytest.approx(1.0)
-        assert conf["WEGE3"] == pytest.approx(0.5)
+        assert conf["EMBR3"] == pytest.approx(1.0 / 1.5)
+        assert conf["WEGE3"] == pytest.approx(0.5 / 1.5)
 
     def test_multiple_tickers_per_neighbor(self):
         neighbors = [
@@ -87,6 +90,51 @@ class TestClassifyTickers:
         neighbors = _neighbors(([], 0.9))
         tickers, conf = classify_tickers(neighbors, article_text="Embraer aviação comercial")
         assert "EMBR3" in tickers
+
+    # ── Keyword-gating tests ─────────────────────────────────────────────────
+
+    def test_keyword_gates_wrong_knn_ticker(self):
+        """Keywords should override wrong kNN votes when text explicitly names a company."""
+        # kNN votes EMBR3 (wrong — neighbors are ambiguous industrial articles)
+        # but text explicitly mentions Marcopolo/ônibus → POMO4 should win
+        neighbors = _neighbors(
+            (["EMBR3"], 0.9),
+            (["EMBR3"], 0.8),
+            (["EMBR3"], 0.7),
+        )
+        tickers, conf = classify_tickers(
+            neighbors,
+            article_text="Marcopolo anuncia novos ônibus articulados para BRT",
+        )
+        assert "POMO4" in tickers    # keyword gate brings POMO4
+        assert "EMBR3" not in tickers  # wrong kNN suppressed by gating
+
+    def test_knn_confirmed_by_keyword(self):
+        """When kNN and keyword agree on a ticker, filtered kNN is returned."""
+        # EMBR3 appears in both kNN votes and keyword match; WEGE3 only in kNN
+        neighbors = _neighbors(
+            (["EMBR3"], 0.9),
+            (["WEGE3"], 0.5),
+        )
+        tickers, conf = classify_tickers(
+            neighbors,
+            article_text="Embraer anuncia novo C-390 para defesa aérea",
+        )
+        assert tickers[0] == "EMBR3"   # correct — kNN+keyword both confirm
+        assert "WEGE3" not in tickers  # kNN-only, not confirmed by keyword
+
+    def test_macro_article_uses_knn_pure_when_no_keyword_match(self):
+        """Macro/sectoral article without company names should use kNN pure."""
+        neighbors = _neighbors(
+            (["WEGE3"], 0.8),
+            (["EMBR3"], 0.5),
+        )
+        tickers, conf = classify_tickers(
+            neighbors,
+            article_text="Setor industrial apresenta crescimento no primeiro trimestre",
+        )
+        # kNN pure — no keyword signal to filter with
+        assert "WEGE3" in tickers  # top kNN vote preserved
 
 
 # ---------------------------------------------------------------------------

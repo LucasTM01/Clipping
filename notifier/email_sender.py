@@ -35,6 +35,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from analyzer.api_analyzer import AnalysisResult
+    from analyzer.deep_dive import ArticleBrief, MarketSynthesis
+    from analyzer.briefing_v2 import BriefItemV2
 
 log = logging.getLogger(__name__)
 
@@ -400,6 +402,282 @@ def _send(msg: MIMEMultipart, to: list[str]) -> None:
         server.sendmail(msg["From"], to, msg.as_string())
 
     log.info(f"Email '{msg['Subject']}' enviado para {to}")
+
+
+def send_deep_dive_email(
+    briefs: list["ArticleBrief"],
+    synthesis: "MarketSynthesis | None",
+    to: list[str],
+) -> None:
+    """Email 3: análise detalhada (números por notícia) + síntese macro."""
+    from config.settings import settings
+
+    try:
+        date_str = datetime.now().strftime("%d/%m/%Y")
+        subject = f"📊 Clipping — Análise Detalhada — {date_str}"
+
+        html = _build_deep_dive_html(briefs, synthesis)
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = settings.email_from
+        msg["To"] = ", ".join(to)
+        msg.attach(MIMEText(html, "html", "utf-8"))
+
+        _send(msg, to)
+    except Exception as exc:
+        log.warning(f"send_deep_dive_email falhou (não crítico): {exc}", exc_info=True)
+
+
+def _build_deep_dive_html(
+    briefs: list["ArticleBrief"],
+    synthesis: "MarketSynthesis | None",
+) -> str:
+    from analyzer.deep_dive import DEEP_DIVE_GROUPS  # type: ignore
+    from config.settings import DOCUMENT_TITLE, DOCUMENT_SUBTITLE
+
+    date_str = datetime.now().strftime("%d/%m/%Y")
+
+    # Group briefs preserving canonical order, then any extra group at the end
+    grouped: dict[str, list] = {g: [] for g in DEEP_DIVE_GROUPS}
+    for b in briefs:
+        grouped.setdefault(b.group, []).append(b)
+    group_order = list(DEEP_DIVE_GROUPS) + [g for g in grouped if g not in DEEP_DIVE_GROUPS]
+
+    n_pos = sum(1 for b in briefs if b.sentiment == "Positivo")
+    n_neg = sum(1 for b in briefs if b.sentiment == "Negativo")
+    n_metrics = sum(len(b.metrics) for b in briefs)
+
+    parts = ["""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+  body{font-family:Arial,sans-serif;font-size:14px;color:#1a1a1a;background:#fff;margin:0;padding:0}
+  .wrap{max-width:780px;margin:0 auto;padding:24px}
+  h1{color:#003366;font-size:22px;margin:0 0 4px}
+  .sub{color:#666;font-size:13px;margin:0 0 20px}
+  .kpi-row{display:flex;gap:12px;margin:16px 0}
+  .kpi{background:#f0f4f8;border-radius:6px;padding:12px 18px;flex:1;text-align:center}
+  .kpi .val{font-size:22px;font-weight:bold;color:#003366}
+  .kpi .lbl{font-size:11px;color:#666;margin-top:2px}
+  .synth{background:#f7f9fc;border:1px solid #d8e2ec;border-left:4px solid #003366;
+    border-radius:4px;padding:14px 18px;margin:18px 0}
+  .synth h2{color:#003366;font-size:16px;margin:0 0 8px}
+  .synth p{line-height:1.6;margin:0 0 10px;color:#222}
+  .theme{margin:10px 0;padding-left:12px;border-left:3px solid #2980b9}
+  .theme .t-title{font-weight:bold;color:#003366}
+  .theme .t-tickers{font-size:11px;color:#2980b9;margin-left:6px}
+  .section-title{background:#003366;color:#fff;padding:8px 14px;font-size:15px;
+    font-weight:bold;margin:26px 0 0;border-radius:4px 4px 0 0}
+  .article{border:1px solid #e0e0e0;border-top:none;padding:14px 16px;background:#fff}
+  .article:last-child{border-radius:0 0 4px 4px}
+  .badge{display:inline-block;padding:2px 8px;border-radius:10px;
+    font-size:12px;font-weight:bold;margin-right:8px}
+  .art-title{font-size:15px;font-weight:bold;margin:0 0 4px}
+  .art-title a{text-decoration:none;color:#003366}
+  .art-meta{font-size:11px;color:#888;margin-bottom:8px}
+  .art-summary{font-size:13px;color:#333;line-height:1.5}
+  .metrics{width:100%;border-collapse:collapse;margin:10px 0 2px}
+  .metrics th{background:#eef2f7;color:#003366;padding:5px 8px;text-align:left;font-size:11px;
+    border-bottom:1px solid #d8e2ec}
+  .metrics td{padding:5px 8px;border-bottom:1px solid #eee;font-size:12px}
+  .metrics tr:last-child td{border-bottom:none}
+  .pos{color:#27ae60;font-weight:bold}
+  .neg{color:#c0392b;font-weight:bold}
+  .empty{color:#aaa;font-style:italic;padding:14px 16px;border:1px solid #e0e0e0;border-top:none}
+  .footer{margin-top:32px;font-size:11px;color:#aaa;text-align:center}
+</style>
+</head><body><div class="wrap">
+"""]
+
+    parts.append(f"""
+<h1>📊 {_esc(DOCUMENT_TITLE)} — Análise Detalhada</h1>
+<p class="sub">{_esc(DOCUMENT_SUBTITLE)} — {date_str}</p>
+<div class="kpi-row">
+  <div class="kpi"><div class="val">{len(briefs)}</div><div class="lbl">Notícias</div></div>
+  <div class="kpi" style="background:#e8f8f0"><div class="val" style="color:#27ae60">{n_pos}</div><div class="lbl">Positivos ✚</div></div>
+  <div class="kpi" style="background:#fdf2f2"><div class="val" style="color:#c0392b">{n_neg}</div><div class="lbl">Negativos −</div></div>
+  <div class="kpi"><div class="val">{n_metrics}</div><div class="lbl">Números extraídos</div></div>
+</div>
+""")
+
+    # Synthesis (Stage B)
+    if synthesis and (synthesis.overview or synthesis.themes):
+        parts.append('<div class="synth"><h2>🔭 Síntese do dia</h2>')
+        for para in (synthesis.overview or "").split("\n"):
+            if para.strip():
+                parts.append(f"<p>{_esc(para.strip())}</p>")
+        for th in synthesis.themes:
+            tk = f'<span class="t-tickers">{_esc(" · ".join(th.tickers))}</span>' if th.tickers else ""
+            parts.append(
+                f'<div class="theme"><span class="t-title">{_esc(th.title)}</span>{tk}'
+                f'<div>{_esc(th.detail)}</div></div>'
+            )
+        parts.append("</div>")
+
+    # Per-group detailed articles
+    for group in group_order:
+        arts = grouped.get(group, [])
+        if not arts:
+            continue
+        parts.append(f'<div class="section-title">{_esc(group)}</div>')
+        for b in arts:
+            sym, bg, fg = _SENTIMENT_BADGE.get(b.sentiment, ("=", "#f5f5f5", "#7f8c8d"))
+            badge = (
+                f'<span class="badge" style="background:{bg};color:{fg};border:1px solid {fg}">'
+                f'{sym} {_esc(b.sentiment)}</span>'
+            )
+            tickers_str = " · ".join(b.tickers) if b.tickers else ""
+            pub = b.published_at[:10] if b.published_at else ""
+            meta = " · ".join(filter(None, [_esc(b.source), pub, tickers_str]))
+            parts.append(f"""
+<div class="article">
+  {badge}
+  <div class="art-title"><a href="{_esc(b.url)}">{_esc(b.title)}</a></div>
+  <div class="art-meta">{meta}</div>
+  <div class="art-summary">{_esc(b.summary or "")}</div>
+""")
+            parts.append(_metrics_table_html(b.metrics))
+            parts.append("</div>")
+
+    parts.append("""
+<div class="footer">Estágio A (resumos + números): modelo local · Estágio B (síntese): API ·
+Pipeline Clipping — Equity Research</div>
+</div></body></html>""")
+
+    return "".join(parts)
+
+
+def _metrics_table_html(metrics: list) -> str:
+    if not metrics:
+        return ""
+    rows = []
+    for m in metrics:
+        rows.append(
+            "<tr>"
+            f"<td>{_esc(m.label)}</td>"
+            f"<td><b>{_esc(m.value)}</b></td>"
+            f"<td>{_esc(m.period or '—')}</td>"
+            f"<td>{_delta_html(m.yoy)}</td>"
+            f"<td>{_delta_html(m.qoq)}</td>"
+            f"<td>{_delta_html(m.mom)}</td>"
+            "</tr>"
+        )
+    return (
+        '<table class="metrics"><tr>'
+        "<th>Indicador</th><th>Valor</th><th>Período</th>"
+        "<th>YoY</th><th>QoQ</th><th>MoM</th></tr>"
+        + "".join(rows) + "</table>"
+    )
+
+
+def _delta_html(val: str | None) -> str:
+    if not val:
+        return "—"
+    cls = ""
+    if val.strip().startswith("+") or "alta" in val.lower():
+        cls = "pos"
+    elif val.strip().startswith("-") or "−" in val or "queda" in val.lower():
+        cls = "neg"
+    return f'<span class="{cls}">{_esc(val)}</span>' if cls else _esc(val)
+
+
+# ---------------------------------------------------------------------------
+# Briefing v2 — "Safra's Morning Notes - AI View" (inglês, factual, por setor)
+# Replica o visual do .docx de referência: cor #00003C, Arial 10pt, setores em
+# negrito com dois-pontos, bullets "texto. — Fonte (hyperlink)".
+# ---------------------------------------------------------------------------
+
+_V2_INK = "#00003C"
+
+
+def _build_briefing_v2_html(items: list["BriefItemV2"], stats: "PipelineStats | None") -> str:
+    from config.prompts import BRIEFING_V2_SECTORS
+
+    date_str = datetime.now().strftime("%B %d, %Y")
+
+    # Agrupa por setor preservando a ordem canônica; setores extras vão ao fim.
+    grouped: dict[str, list] = {s: [] for s in BRIEFING_V2_SECTORS}
+    for it in items:
+        grouped.setdefault(it.sector, []).append(it)
+    sector_order = list(BRIEFING_V2_SECTORS) + [s for s in grouped if s not in BRIEFING_V2_SECTORS]
+
+    n_read = stats.n_fetched if stats else len(items)
+    n_approved = stats.n_approved if stats else len(items)
+
+    parts = [f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+  body{{font-family:Arial,Helvetica,sans-serif;font-size:13px;color:{_V2_INK};
+    background:#fff;margin:0;padding:0;line-height:1.45}}
+  .wrap{{max-width:720px;margin:0 auto;padding:24px}}
+  .date{{font-size:13px;font-weight:bold;color:{_V2_INK};margin:0 0 10px}}
+  .greet{{font-size:13px;color:{_V2_INK};margin:0 0 14px}}
+  .stats{{border:1px solid #d7d7e0;border-radius:4px;background:#f6f6fb;
+    padding:8px 12px;margin:0 0 18px;font-size:12px;color:{_V2_INK}}}
+  .stats b{{font-size:13px}}
+  .sector{{font-size:13px;font-weight:bold;color:{_V2_INK};margin:16px 0 4px}}
+  ul{{margin:0 0 6px;padding-left:20px}}
+  li{{font-size:13px;color:{_V2_INK};margin:4px 0;line-height:1.45}}
+  a{{color:{_V2_INK};text-decoration:underline}}
+  .footer{{margin-top:26px;font-size:11px;font-style:italic;color:#666}}
+</style>
+</head><body><div class="wrap">
+<div class="date">{date_str}</div>
+<div class="greet">Good morning!<br>Here is a summary of the news in our Capital Goods
+daily. You can find details below:</div>
+"""]
+
+    # Process stats (não existe no .docx de referência — pedido do usuário)
+    parts.append(f"""
+<div class="stats">
+  <b>{n_read}</b> news read &nbsp;·&nbsp; <b>{n_approved}</b> approved &nbsp;·&nbsp;
+  <b>{len(items)}</b> in this briefing
+</div>
+""")
+
+    if not items:
+        parts.append('<p style="font-style:italic;color:#666">No relevant news today.</p>')
+    else:
+        for sector in sector_order:
+            arts = grouped.get(sector, [])
+            if not arts:
+                continue
+            parts.append(f'<div class="sector">{_esc(sector)}:</div><ul>')
+            for it in arts:
+                text = _esc(it.text.strip())
+                link = f'<a href="{_esc(it.url)}">{_esc(it.source)}</a>' if it.url else _esc(it.source)
+                parts.append(f"<li>{text} &mdash; {link}</li>")
+            parts.append("</ul>")
+
+    parts.append("""
+<div class="footer">Generated automatically — AI View · Equity Research.
+If you wish to be removed from this mailing list, please let us know.</div>
+</div></body></html>""")
+
+    return "".join(parts)
+
+
+def send_briefing_v2_email(
+    items: list["BriefItemV2"],
+    stats: "PipelineStats | None",
+    to: list[str],
+) -> None:
+    """Email briefing v2 (default): inglês, factual, por setor."""
+    from config.settings import settings
+
+    try:
+        subject = "Safra's Morning Notes - AI View - Capital Goods"
+        html = _build_briefing_v2_html(items, stats)
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = settings.email_from
+        msg["To"] = ", ".join(to)
+        msg.attach(MIMEText(html, "html", "utf-8"))
+
+        _send(msg, to)
+    except Exception as exc:
+        log.warning(f"send_briefing_v2_email falhou (não crítico): {exc}", exc_info=True)
 
 
 def send_briefing_email(analyses: list[AnalysisResult], to: list[str]) -> None:

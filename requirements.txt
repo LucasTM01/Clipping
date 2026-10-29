@@ -24,3 +24,15 @@ sentence-transformers>=3.0
 
 # Persistência leve
 sqlalchemy>=2.0
+
+# Publicação da base de notícias no data lake do DataHandler (data/drive_sync.py).
+# Já vinham como dependência transitiva; declaradas aqui porque agora há código
+# que as usa diretamente e uma resolução diferente do pip quebraria o sync.
+pandas>=2.0
+pyarrow>=14
+
+# Extração de texto de PDFs (CVM scraper)
+pdfplumber>=0.11
+
+# Acesso a cookies do Chrome (enriquecimento Reuters/Bloomberg quando perfil está bloqueado)
+pywin32>=305

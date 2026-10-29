@@ -8,15 +8,16 @@ from datetime import datetime
 from fetcher.rss_fetcher import Article
 from scrapers.aeroin import AeroinScraper
 from scrapers.airway import AirwayScraper
-from scrapers.autodata import AutodataScraper
 from scrapers.automotivebusiness import AutomotiveBusinessScraper
 from scrapers.bloomberg import BloombergScraper
-from scrapers.braziljournal import BrazilJournalScraper
-from scrapers.canalsolar import CanalSolarScraper
+from scrapers.google_news import LOCALE_PT_BR, GoogleNewsScraper
 from scrapers.infomoney import InfoMoneyScraper
 from scrapers.oglobo import OGloboScraper
 from scrapers.portalsolar import PortalSolarScraper
+from scrapers.randoncorp import RandoncorpScraper
 from scrapers.reuters import ReutersScraper
+from scrapers.wordpress import WordPressScraper
+from scrapers.cvm import CVMScraper
 from scrapers.base import BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -25,18 +26,31 @@ logger = logging.getLogger(__name__)
 SCRAPERS: list[BaseScraper] = [
     AeroinScraper(),
     AirwayScraper(),
-    AutodataScraper(),
+    WordPressScraper("Autodata", "https://www.autodata.com.br"),
     AutomotiveBusinessScraper(),
-    BrazilJournalScraper(),
-    CanalSolarScraper(),
+    WordPressScraper("Canal Solar", "https://canalsolar.com.br"),
+    WordPressScraper("Diário do Transporte", "https://diariodotransporte.com.br"),
+    WordPressScraper("Aerospace Global News", "https://aerospaceglobalnews.com", language="en"),
+    RandoncorpScraper(),
+    # weg.net answers 403 to anything but an interactive browser — listing via Google News.
+    GoogleNewsScraper(
+        "WEG News",
+        site="weg.net/institutional",
+        base_url="https://www.weg.net/institutional/BR/pt/all-news/list",
+        language="pt-br",
+        locale=LOCALE_PT_BR,
+        url_pattern=r"https://www\.weg\.net/institutional/[^/]+/[^/]+/news/",
+    ),
     InfoMoneyScraper(),
     OGloboScraper(),
     PortalSolarScraper(),
     ReutersScraper(),
     ReutersScraper("Reuters Autos & Transportation", "/business/autos-transportation/"),
     ReutersScraper("Reuters Energy", "/business/energy/"),
-    BloombergScraper("Bloomberg Transportation", "phx-industries-transportation"),
-    BloombergScraper("Bloomberg Energy", "phx-industries-energy"),
+    BloombergScraper("Bloomberg Transportation", "transportation"),
+    BloombergScraper("Bloomberg Energy", "energy"),
+    BloombergScraper("Bloomberg Industries", "industries"),
+    CVMScraper(),
 ]
 
 

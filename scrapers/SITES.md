@@ -85,53 +85,25 @@ data ou particularidade conhecida deve ser refletida aqui.
 
 ## Bloomberg
 
-- **URLs cobertas:**
-  - `https://www.bloomberg.com/industries/transportation` (`phx-industries-transportation`)
-  - `https://www.bloomberg.com/industries/energy` (`phx-industries-energy`)
+- **Fontes (instâncias):** `"Bloomberg Energy"`, `"Bloomberg Transportation"`, `"Bloomberg Industries"`
 - **Arquivo:** `scrapers/bloomberg.py` (`BloombergScraper`)
-- **Plataforma:** Next.js SPA + Akamai bot protection
-- **Acesso:** Requer Chrome real (`channel="chrome"`) + stealth init script
-  (`--disable-blink-features=AutomationControlled` + `navigator.webdriver=undefined`).
-  Chromium bundled do Playwright é bloqueado mesmo sem headless.
-- **Paginação:** API interna `lineup-next/api/paginate`:
-  ```
-  GET /lineup-next/api/paginate
-    ?id=archive_story_list
-    &page=phx-industries-{industry}
-    &offset=0|12|24|...
-    &variation=archive&type=lineup_content&locale=en
-  ```
-  Chamada via `page.evaluate(fetch(..., {credentials:"include"}))` para reutilizar
-  cookies da sessão já estabelecida. Cada página retorna 12 artigos. Loop até
-  `publishedAt < since` OU `SCRAPER_MAX_PAGES` iterações.
-- **Dados da listagem (JSON):** `items[].headline`, `items[].url` (relativo),
-  `items[].publishedAt` (ISO-8601 UTC — sem necessidade de parse de datas),
-  `items[].premium` (booleano de paywall), `items[].summary`.
-- **Conteúdo:** Bloomberg expõe 1–2 parágrafos server-rendered antes do JS de
-  paywall. `trafilatura.extract` sobre o HTML da página do artigo (Playwright)
-  captura esses parágrafos. Fallback: `items[].summary` da API se trafilatura
-  retornar vazio.
-- **published_at:** `publishedAt` da API/`__NEXT_DATA__` (preferido). Fallback: `<time datetime>`
-  no HTML do artigo via `extract_published_at()`.
-- **Janela de coleta:** `BLOOMBERG_LOOKBACK_HOURS` (default 336 = 14 dias). Bloomberg
-  Industry Pages são digests curados que atualizam com baixa frequência — usar janela
-  mais ampla que o `since` do pipeline (24h) evita dias vazios. Novelty detection do
-  screener (Qdrant) lida com deduplicação de artigos antigos repetidos.
-- **Extração de artigos (offset=0 vs API):** O primeiro lote (offset=0) está embutido no
-  `__NEXT_DATA__` do HTML da página de listagem. `_extract_items_from_html()` extrai via
-  `_walk_for_items()`. Lotes subsequentes (offset=12, 24, …) buscados via `_FETCH_JS`.
-- **URLs de artigo:** `__NEXT_DATA__` usa URLs absolutas; API retorna relativas. O scraper
-  normaliza ambas (se começa com `http`, usa como está; senão, prefixa `_BASE`).
-- **Idioma:** `en` (English).
-- **Notas:**
-  - Requer Google Chrome instalado na máquina. Pipeline falha graciosamente se
-    Chrome não estiver disponível (log de erro, continua sem Bloomberg).
-  - `Article.source`: `"Bloomberg Transportation"` ou `"Bloomberg Energy"`.
-  - Artigos premium (`premium=true`) são incluídos — o resumo/parágrafos
-    visíveis (1–2 parágrafos pre-paywall) ainda têm valor para o screener.
-  - Bot detection Akamai é probabilístico — `channel="chrome"` + stealth funciona na
-    maioria das sessões. Quando bloqueado ("Are you a robot?"), o scraper loga erro e
-    retorna `[]` graciosamente.
+- **Por que não a página /industries/<x>:** PerimeterX ("Are you a robot?") bloqueia
+  qualquer browser automatizado — inclusive Chrome real + perfil dedicado. A versão antiga
+  (Playwright + stealth) retornava 0 artigos todos os dias.
+- **Fontes de dados (públicas, só `requests`):**
+  - Sitemap Google News `https://www.bloomberg.com/sitemaps/news/latest.xml` — todas as
+    matérias dos últimos ~2 dias com `publication_date` exata e título; sem seção.
+    Só `/news/articles/` e `/news/features/` (opinião/newsletters/live descartados).
+  - RSS Industries `https://www.bloomberg.com/feeds/industries/news.rss` — ~20 matérias
+    mais recentes com descrição (vira `full_text`).
+- **Classificação:** cada matéria vai para UMA seção por regex no título + slug
+  (`_TRANSPORTATION_RE` primeiro, depois `_ENERGY_RE`); sobras do feed Industries →
+  "Bloomberg Industries"; sobras do sitemap (política, mercados…) são descartadas.
+  As três instâncias compartilham um cache de 10 min — os feeds são baixados uma vez por run.
+- **published_at:** `publication_date` (sitemap) / `pubDate` (RSS), UTC. Filtrado por `since`.
+- **Conteúdo:** só a descrição do RSS quando houver; corpo é paywall e o Playwright
+  enrich desiste após 3 bloqueios seguidos (ver `fetcher/rss_fetcher.py`).
+- **Idioma:** `en`. ~50 artigos/dia nas três fontes.
 
 ---
 
@@ -160,69 +132,72 @@ data ou particularidade conhecida deve ser refletida aqui.
 
 ---
 
-## Autodata
+## Sites WordPress (REST API) — Autodata, Canal Solar, Diário do Transporte, Aerospace Global News
 
-- **Base URL:** https://www.autodata.com.br/ultimas-noticias/
-- **Arquivo:** `scrapers/autodata.py` (`AutodataScraper`)
-- **Plataforma:** Listagem JS-rendered (Bootstrap + jQuery) — Playwright necessário para
-  a fase de listagem. Páginas de artigo são server-rendered — requests funciona direto.
-- **Paginação:** query string `?p=N` (página 1 = URL base; página 2+ = `?p=N`).
-  Itera até `SCRAPER_MAX_PAGES` ou até data do artigo mais antigo < `since`.
-  Fim detectado por ausência de links `?p=N` no HTML renderizado.
-- **Listagem (extração de URLs/títulos):** cada card tem a estrutura:
-  ```html
-  <div class="todas-as-noticias-cel">
-    <span class="todas-as-noticias-cat">Categoria</span>
-    <li class="titulo-ultimas-noticias">
-      <a href="https://www.autodata.com.br/noticias/YYYY/MM/DD/slug/id/">Título</a>
-    </li>
-  </div>
-  ```
-  A categoria está em `<span>` (não capturada pelo regex). Regex:
-  `href="(https://www.autodata.com.br/noticias/YYYY/MM/DD/...)">...</a>`
-- **published_at:** extraído do caminho da URL (`/noticias/YYYY/MM/DD/`) →
-  `00:00:00 BR_TZ` convertido para UTC. O artigo não expõe `<time datetime>`,
-  JSON-LD `datePublished` nem `<meta property="article:published_time">`.
-- **Conteúdo:** `trafilatura.extract` sobre HTML do artigo via requests (paralelo).
-- **Concorrência:** Playwright sequencial para listagem; `ThreadPoolExecutor`
-  (`SCRAPER_CONCURRENCY` workers) para artigos.
-- **Notas:**
-  - Sem paywall. Artigos têm corpo completo (tipicamente 1500–6000 chars).
-  - Horário não disponível — todos os artigos do mesmo dia têm `published_at` = meia-noite BR_TZ.
+- **Arquivo:** `scrapers/wordpress.py` (`WordPressScraper(name, base_url)`) — uma instância por site
+- **Endpoint:** `GET {base}/wp-json/wp/v2/posts?per_page=50&page=N&orderby=date&order=desc&_fields=date_gmt,link,title,excerpt,content`
+  Paginação até o post mais antigo da página < `since` (ou página incompleta).
+- **published_at:** `date_gmt` (UTC exato). **Conteúdo:** `content.rendered` → texto
+  (fallback `excerpt`) — sem fetch por artigo.
+- **Por que REST e não HTML/RSS:** o scraper HTML do Autodata quebrou (listagem
+  `/ultimas-noticias/` virou 404) e o do Canal Solar também (0 artigos/dia). Os RSS são
+  curtos (10–12 itens) e o do Diário do Transporte mistura posts antigos.
+- **Instâncias (registry.py):** `Autodata` (autodata.com.br), `Canal Solar`
+  (canalsolar.com.br — a edição /en/ é tradução automática dos mesmos posts, sem rota REST),
+  `Diário do Transporte` (diariodotransporte.com.br, ~30 posts/dia), `Aerospace Global News`
+  (aerospaceglobalnews.com, `en`).
+- **Novo site WordPress:** basta `WordPressScraper("Nome", "https://site")` no registry +
+  nome em `SCRAPERS_ENABLED`. Testar antes: `curl https://site/wp-json/wp/v2/posts?per_page=1`.
+
+---
+
+## Randoncorp Blog
+
+- **Base URL:** https://www.randoncorp.com/pt/blog/
+- **Arquivo:** `scrapers/randoncorp.py` (`RandoncorpScraper`)
+- **Plataforma:** Umbraco (sem `/wp-json/`, sem RSS). A página do blog lista TODOS os
+  posts (~800 cards, ~1.4 MB): `<a href=".../pt/blog/<slug>/" data-title="...">` com
+  `Publicado em DD/MM/YYYY`.
+- **published_at:** só o dia (meia-noite BR_TZ). Filtro por dia: posts do dia de `since`
+  em diante — um post de ontem pode aparecer no run das 19h e no da manhã seguinte.
+- **Conteúdo:** `trafilatura` na página do post (paralelo), removendo o "Buscando por" do
+  widget de busca.
+
+---
+
+## WEG News
+
+- **Listagem:** Google News RSS `site:weg.net/institutional` (pt-BR) — `scrapers/google_news.py`
+- **Por quê:** weg.net responde 403 a tudo que não é browser interativo (inclusive
+  robots.txt e sitemap). URLs decodificadas e filtradas por `/institutional/<país>/<lang>/news/`
+  (o Google também indexa catálogos e PDFs).
+- **Conteúdo:** só título (corpo 403; domínio em `_NEVER_ENRICH_DOMAINS`). ~1 release a cada 2 dias.
 
 ---
 
 ## Reuters (múltiplas seções)
 
-- **Arquivo:** `scrapers/reuters.py` (`ReutersScraper`) — uma instância por seção
+- **Arquivo:** `scrapers/reuters.py` (`ReutersScraper`, subclasse de `GoogleNewsScraper`)
 - **Seções cobertas:**
   - `"Reuters Aerospace & Defense"` → `/business/aerospace-defense/`
   - `"Reuters Autos & Transportation"` → `/business/autos-transportation/`
   - `"Reuters Energy"` → `/business/energy/`
-- **Plataforma:** SPA + Cloudflare bot protection — acesso direto à página e artigos bloqueados
-- **Fonte de dados:** Google News Sitemap XML (não protegido):
+- **Plataforma:** DataDome — páginas de seção, artigos E o sitemap
+  `/arc/outboundfeeds/news-sitemap/` respondem 401. O sitemap passava de forma
+  intermitente (0–7 artigos/dia); as seções publicam 10–40/dia.
+- **Fonte de dados:** Google News RSS com `site:` restrito ao caminho da seção:
   ```
-  https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml
-  https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml&from=50
-  https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml&from=100
-  ...
+  https://news.google.com/rss/search?q=site:reuters.com/business/energy+when:1d&hl=en-US&gl=US&ceid=US:en
   ```
-  50 entradas por página em ordem cronológica reversa. Loop para até `SCRAPER_MAX_PAGES`
-  páginas ou até data < `since`.
-- **Filtragem por seção:** URLs cujo caminho contém o `section` configurado na instância.
-  Cada página do sitemap mistura todas as seções da Reuters; só as entradas relevantes
-  são retidas.
-- **published_at:** `<news:publication_date>` ISO-8601 UTC no sitemap — sem parsing adicional.
-- **Conteúdo:** `full_text = ""` — artigos individuais retornam desafio Cloudflare.
-  O screener usa apenas o título para embedding. O step `enrich_full_text` tentará
-  re-fetch e falhará silenciosamente.
-- **Idioma:** `en` (English).
-- **Notas:**
-  - Sem Playwright — apenas `requests` para o sitemap XML.
-  - `robots.txt` da Reuters bloqueia bots IA identificados; o scraper usa UA de
-    navegador padrão e acessa apenas o sitemap público.
-  - Para adicionar nova seção: instanciar `ReutersScraper("Nome", "/secao/path/")` em
-    `registry.py` e acrescentar o nome (lowercase) a `SCRAPERS_ENABLED`.
+  `when:Nd` cobre a janela; filtro fino por `since` no `pubDate`. Sufixo " - Reuters" removido.
+- **URLs:** os links `news.google.com/rss/articles/<id>` são decodificados para a URL real
+  da Reuters (GET da página do artigo → `data-n-a-sg`/`data-n-a-ts` → um POST em lote ao
+  `batchexecute`, mapeado pelo índice da requisição). Falhou → mantém o link do Google
+  (redireciona no browser).
+- **Conteúdo:** `full_text = ""`. Screener usa o título. Playwright enrich desiste após 3 × 401.
+- **Idioma:** `en`.
+- **Nova seção:** `ReutersScraper("Nome", "/secao/path/")` em `registry.py` + nome
+  (lowercase) em `SCRAPERS_ENABLED`.
 
 ---
 
@@ -247,13 +222,44 @@ data ou particularidade conhecida deve ser refletida aqui.
 - **Notas:**
   - Sem paywall, sem WAF relevante — User-Agent padrão de navegador é
     suficiente.
+  - A editoria "mercado" (`/noticias/editoria/mercado`) já aparece inteira em
+    "últimas notícias" — não precisa de listagem própria. O site publica ~1 matéria/dia.
   - A data da listagem e a do artigo são idênticas (mesmo JSON-LD). O scraper
     usa a da listagem como primária para evitar fetch redundante de data.
 
 ---
 
+## CVM RAD — Fatos Relevantes e Comunicados ao Mercado
+
+- **Base URL:** https://www.rad.cvm.gov.br/ENET/frmConsultaExternaCVM.aspx
+- **Arquivo:** `scrapers/cvm.py` (`CVMScraper`) — só HTTP, sem browser
+- **Empresas cobertas:** 10 tickers com códigos CVM pré-configurados (EMBR3, POMO4, RAPT4, FRAS3, MYPK3, WEGE3, INTB3, GGPS3, ARML3, MILS3)
+- **Categorias:** "Fato Relevante" e "Comunicado ao Mercado"
+- **Listagem:** `POST .../frmConsultaExternaCVM.aspx/ListarDocumentos` (JSON, o mesmo AJAX
+  que a tela usa) com `categoria="IPE_-1_-1_-1"` e período `dataDe..dataAte` — UMA chamada
+  traz todas as companhias (~300 docs/dia); filtro local por código CVM + categoria + `since`.
+  `d.dados` = linhas separadas por `&*`, campos por `$&`; o código vem como `02008-7`
+  (= 20087, o dígito após o hífen faz parte do código).
+- **Download de PDFs:** `frmDownloadDocumento.aspx?Tela=ext&numSequencia=..&numVersao=..&numProtocolo=..&descTipo=IPE&CodigoInstituicao=1`
+  (args de `OpenDownloadDocumentos(...)` na coluna de ações). Content-type vem `text/html`, o corpo é o PDF.
+- **URL do Article:** `frmExibirArquivoIPEExterno.aspx?NumeroProtocoloEntrega=<protocolo>`.
+- **Extração de texto:** `pdfplumber` (limite: `_MAX_PDF_CHARS = 8000`). PDFs de imagem retornam texto vazio — screener usa o título rico que já contém categoria/tipo/assunto.
+- **published_at:** "Data Entrega" (`DD/MM/YYYY HH:MM`, BR_TZ → UTC).
+- **source format:** `"CVM — EMBR3"` (com —) — permite filtrar no audit log.
+- **Notas:**
+  - A versão anterior automatizava o formulário via Playwright com seletores que não
+    casavam ("não foi possível selecionar categoria") — nunca coletou documento.
+  - Dados abertos (dados.cvm.gov.br IPE) só atualizam semanalmente — não servem para o diário.
+  - Muitos dias retornam 0 documentos (normal).
+
+---
+
 ## Como adicionar um novo site
 
+0. Antes de escrever parsing de HTML, procurar fonte estruturada: RSS (`/feed/`),
+   WordPress REST (`/wp-json/wp/v2/posts` → só instanciar `WordPressScraper`),
+   sitemap de notícias, ou Google News (`GoogleNewsScraper` com `site:`) se o site
+   bloqueia acesso automatizado.
 1. Criar `scrapers/<nome>.py` com classe que satisfaz `BaseScraper`
    (`scrapers/base.py`).
 2. Reusar `browser_context()` e `extract_published_at()` de

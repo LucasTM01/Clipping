@@ -149,11 +149,14 @@ class TestBuildRationale:
 
 class TestRelevanceScorerScore:
     def _make_scorer(self, discard_threshold=0.5446):
+        from screener.relevance_scorer import TIER_HIGH, TIER_MEDIUM
         mock_store = MagicMock()
         scorer = RelevanceScorer.__new__(RelevanceScorer)
         scorer._store = mock_store
         scorer._calibration = {"threshold": discard_threshold, "k": 5}
         scorer._discard_threshold = discard_threshold
+        scorer._tier_medium = TIER_MEDIUM
+        scorer._tier_high = TIER_HIGH
         return scorer, mock_store
 
     def test_score_returns_scored_article(self):
