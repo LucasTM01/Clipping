@@ -177,12 +177,9 @@ _NO_ENRICH_DOMAINS: frozenset[str] = frozenset({
 
 # Domínios que sempre recusam o fetch (403 / paywall) e não têm rota via
 # Playwright — nenhum enriquecimento é tentado; fica o summary do feed.
-#   ft.com           → 403 em 100% das tentativas (paywall)
 #   weg.net          → 403 para tudo que não é browser interativo
 #   news.google.com  → links do Google News que não puderam ser decodificados
 _NEVER_ENRICH_DOMAINS: frozenset[str] = frozenset({
-    "www.ft.com",
-    "ft.com",
     "www.weg.net",
     "weg.net",
     "news.google.com",

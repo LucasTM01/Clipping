@@ -47,7 +47,6 @@ _SOURCE_DISPLAY: list[tuple[str, str]] = [
     ("valor", "Valor"),
     ("estadão", "Estadão"),
     ("estadao", "Estadão"),
-    ("financial times", "Financial Times"),
     ("folha", "Folha"),
     ("cnn", "CNN"),
     ("aeroin", "Aeroin"),

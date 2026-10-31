@@ -56,7 +56,6 @@ câmbio, commodities com impacto setorial).
 | Estadão Política | O Estado de S.Paulo | PT | padrão |
 | Estadão Internacional | O Estado de S.Paulo | PT | padrão |
 | Estadão Economia | O Estado de S.Paulo | PT | padrão |
-| Financial Times Brazil | FT.com | EN | 336h (14 dias — baixa frequência, curado) |
 | CNN Brasil | CNN Brasil | PT | padrão |
 | Folha Mercados | Folha de S.Paulo | PT | padrão |
 | Folha Mundo | Folha de S.Paulo | PT | padrão |

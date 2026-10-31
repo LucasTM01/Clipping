@@ -102,7 +102,7 @@ applies those tickers verbatim (empty list = macro, no keyword backfill).
 ## Source Health Check
 
 ```powershell
-# List all sources (10 RSS + 19 scrapers)
+# List all sources (9 RSS + 19 scrapers)
 python -m tools.check_source --list
 
 # Test one source by name (case + diacritic insensitive, fuzzy match)
@@ -197,7 +197,7 @@ Data flows top-to-bottom through `pipeline.py → run_pipeline()`. No layer read
 Layer 1    fetcher/rss_fetcher.py      requests (timeout) + feedparser → list[Article]
 Layer 1b   fetcher/rss_fetcher.py      trafilatura full-text (ThreadPool, ENRICH_MAX_WORKERS)
                                         skips _NO_ENRICH_DOMAINS (reuters.com, bloomberg.com)
-                                        and _NEVER_ENRICH_DOMAINS (ft.com, weg.net, news.google.com)
+                                        and _NEVER_ENRICH_DOMAINS (weg.net, news.google.com)
 Layer 1b'  fetcher/rss_fetcher.py      enrich_with_playwright: Reuters/Bloomberg via Chrome
                                         pipeline profile → sequential; gives up per domain after 3× 401/403
 Layer 1c   scrapers/registry.py        scrapers (sites sem RSS) -> list[Article] — see scrapers/SITES.md

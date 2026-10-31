@@ -179,12 +179,6 @@ RSS_FEEDS = [
         "language": "pt-br",
     },
     {
-        "name": "Financial Times Brazil",
-        "url": "https://www.ft.com/brazil?format=rss",
-        "language": "en",
-        "lookback_hours": 336,  # curated stream, low publication frequency
-    },
-    {
         "name": "CNN",
         "url": "https://admin.cnnbrasil.com.br/feed/",
         "language": "pt-br",
